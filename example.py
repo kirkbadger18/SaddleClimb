@@ -9,36 +9,30 @@ from ase.build import fcc111, add_adsorbate
 from numpy.linalg import eigh
 from ase.constraints import FixAtoms
 from saddleclimb import SaddleClimb
+from ase.calculators.vasp import Vasp
 
-#testmoli = read('POSCAR_10')
-#del testmoli.constraints
-slab = fcc111('Pt', size=(3,3,4))
-add_adsorbate(slab, 'H', 1.5, 'ontop')
-slab.center(vacuum=10.0, axis=2)
-testmoli=slab.copy()
-ci = FixAtoms(indices=[atom.index for atom in testmoli if atom.symbol == 'Pt'])
-testmolf=testmoli.copy()
-cf = FixAtoms(indices=[atom.index for atom in testmolf if atom.symbol == 'Pt'])
-testmolf[36].position+=[1.4, 2.0, 0]
-testmoli.set_constraint(ci)
-testmolf.set_constraint(cf)
-calc = EMT()
-testmoli.calc = calc
-dyn = BFGS(testmoli, trajectory='testi.traj')
-dyn.run(fmax=0.05)
-vib = Vibrations(testmoli, indices=[36], delta=1e-3, nfree=4)
-vib.run()
+calculator=Vasp(xc='beef-vdw',
+	encut=340.14, #25Ry
+	luse_vdw=True,
+	zab_vdw=-1.8867,
+	kpts=(3,3,1),
+	ismear=1,
+	sigma=0.1,
+	ibrion=-1,
+	ispin=2,
+	algo='Fast',
+	lreal='Auto',
+	ediff=1e-5,
+	isym=0,) 
+
+testmoli=read('testi2.traj')
+testmolf=read('testf2.traj')
+
+vib = Vibrations(testmoli, indices=[36])
 vib.get_frequencies()
 dat = vib.get_vibrations(testmoli)
 H = dat.get_hessian_2d()
 
-
-testmolf.calc = calc
-dyn2 = BFGS(testmolf, trajectory='testf.traj')
-dyn2.run(fmax=0.05)
-
-climber = SaddleClimb(testmoli, testmolf, [36], calc, H)
+climber = SaddleClimb(testmoli, testmolf, [36], calculator, H)
 climber.run()
-
-
 
