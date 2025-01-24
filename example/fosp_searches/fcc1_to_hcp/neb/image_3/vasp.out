@@ -1,0 +1,94 @@
+ running   48 mpi-ranks, on    1 nodes
+ distrk:  each k-point on   48 cores,    1 groups
+ distr:  one band on    1 cores,   48 groups
+ vasp.6.4.2 20Jul23 (build Mar 01 2024 16:46:03) complex                        
+  
+ POSCAR found type information on POSCAR PtH 
+ POSCAR found :  2 types and      37 ions
+ Reading from existing POTCAR
+ scaLAPACK will be used
+ -----------------------------------------------------------------------------
+|                                                                             |
+|           W    W    AA    RRRRR   N    N  II  N    N   GGGG   !!!           |
+|           W    W   A  A   R    R  NN   N  II  NN   N  G    G  !!!           |
+|           W    W  A    A  R    R  N N  N  II  N N  N  G       !!!           |
+|           W WW W  AAAAAA  RRRRR   N  N N  II  N  N N  G  GGG   !            |
+|           WW  WW  A    A  R   R   N   NN  II  N   NN  G    G                |
+|           W    W  A    A  R    R  N    N  II  N    N   GGGG   !!!           |
+|                                                                             |
+|     For optimal performance we recommend to set                             |
+|       NCORE = 2 up to number-of-cores-per-socket                            |
+|     NCORE specifies how many cores store one orbital (NPAR=cpu/NCORE).      |
+|     This setting can greatly improve the performance of VASP for DFT.       |
+|     The default, NCORE=1 might be grossly inefficient on modern             |
+|     multi-core architectures or massively parallel machines. Do your        |
+|     own testing! More info at https://www.vasp.at/wiki/index.php/NCORE      |
+|     Unfortunately you need to use the default for GW and RPA                |
+|     calculations (for HF NCORE is supported but not extensively tested      |
+|     yet).                                                                   |
+|                                                                             |
+ -----------------------------------------------------------------------------
+
+
+     **************************************************************************
+     Initializing libbeef V0.1.3 with the BEEF-vdW functional.
+     Citation: Wellendorff et al., PRB 85, 235149 (2012).
+     **************************************************************************
+
+ -----------------------------------------------------------------------------
+|                                                                             |
+|               ----> ADVICE to this user running VASP <----                  |
+|                                                                             |
+|     You have switched on vdW-DFT.                                           |
+|     This routine was written and supplied by Jiri Klimes. We recommend      |
+|     that you carefully read and cite the following publications:            |
+|       J. Klimes, D.R. Bowler, A. Michelides                                 |
+|          J. Phys.: Cond Matt. 22 022201 (2010)                              |
+|       J. Klimes, D.R. Bowler, A. Michelides                                 |
+|          Phys. Rev. B. 83, 195131 (2011)                                    |
+|     and references therein.                                                 |
+|                                                                             |
+ -----------------------------------------------------------------------------
+
+ Reading from existing POTCAR
+ -----------------------------------------------------------------------------
+|                                                                             |
+|               ----> ADVICE to this user running VASP <----                  |
+|                                                                             |
+|     You enforced a specific xc type in the INCAR file but a different       |
+|     type was found in the POTCAR file.                                      |
+|     I HOPE YOU KNOW WHAT YOU ARE DOING!                                     |
+|                                                                             |
+ -----------------------------------------------------------------------------
+
+ LDA part: xc-table for Pade appr. of Perdew
+ found WAVECAR, reading the header
+ POSCAR, INCAR and KPOINTS ok, starting setup
+ FFT: planning ... GRIDC
+ FFT: planning ... GRID_SOFT
+ FFT: planning ... GRID
+ reading WAVECAR
+ the WAVECAR file was read successfully
+ initial charge from wavefunction
+ entering main loop
+       N       E                     dE             d eps       ncg     rms          rms(c)
+Total vdW correction in eV:     52.0091893
+DAV:   1    -0.104575196879E+03   -0.10458E+03   -0.28538E-02  6864   0.309E-01    0.577E-01
+Total vdW correction in eV:     52.0084095
+RMM:   2    -0.104622756371E+03   -0.47559E-01   -0.35441E-02  6632   0.300E-01    0.259E+00
+Total vdW correction in eV:     52.0084874
+RMM:   3    -0.104584539248E+03    0.38217E-01   -0.15937E-02  6787   0.231E-01    0.124E+00
+Total vdW correction in eV:     52.0085374
+RMM:   4    -0.104572452480E+03    0.12087E-01   -0.26156E-03  6636   0.839E-02    0.203E-01
+Total vdW correction in eV:     52.0083970
+RMM:   5    -0.104572078302E+03    0.37418E-03   -0.48984E-04  6645   0.369E-02    0.110E-01
+Total vdW correction in eV:     52.0082561
+RMM:   6    -0.104572006748E+03    0.71553E-04   -0.93370E-05  6833   0.159E-02    0.550E-02
+Total vdW correction in eV:     52.0082132
+RMM:   7    -0.104571995993E+03    0.10756E-04   -0.31177E-05  5161   0.884E-03    0.492E-02
+Total vdW correction in eV:     52.0081903
+RMM:   8    -0.104571986555E+03    0.94379E-05   -0.18580E-05  4553   0.714E-03
+Total vdW correction in eV:     52.0086391
+Total vdW correction in eV:     52.0082181
+   1 F= -.10457199E+03 E0= -.10454058E+03  d E =-.942235E-01
+ writing wavefunctions
