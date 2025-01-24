@@ -24,9 +24,6 @@ geometry files for the initial and final states of your reaction. Then you can u
 ```python
 from ase import Atoms, Atom
 from ase.io import read
-from numpy.linalg import eigh
-from ase.constraints import FixAtoms
-from saddleclimb import SaddleClimb
 from ase.calculators.vasp import Vasp
 from saddleclimb import SaddleClimb
 
