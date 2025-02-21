@@ -1,62 +1,81 @@
 import sys
+import os
+import scipy
 import numpy as np
 import numpy.linalg as LA
 from numpy import matmul as mult
+from ase.atoms import Atoms
+from ase.calculators.calculator import Calculator
 from ase.io.trajectory import Trajectory
-from ase.optimize import BFGS
+from pathlib import Path
+
 
 class SaddleClimb:
 
-    def __init__(self, atoms_initial, atoms_final, calculator, indices, fmax=0.01):
+    def __init__(
+            self: None,
+            atoms_initial: Atoms,
+            atoms_final: Atoms,
+            calculator: Calculator,
+            indices: list,
+            fmax: float = 0.01,
+            delta0: float = 1e-2,
+            rho_dec: float = 5,
+            rho_inc: float = 1.035,
+            sigma_inc: float = 1.15,
+            sigma_dec: float = 0.65,
+            eta: float = 1e-3,
+            alpha0: float = 1,
+            logfile: str = 'climb.log',
+            trajfile: str = 'climb.traj',
+            ) -> None:
 
         self.atoms_initial = atoms_initial
         self.atoms_final = atoms_final
         self.indices = indices
         self.hessian = 70 * np.eye(3*len(self.indices))
         self.calculator = calculator
-        self.fmax=fmax
+        self.fmax = fmax
+        self.delta = delta0
+        self.rho_inc = rho_inc
+        self.rho_dec = rho_dec
+        self.sigma_inc = sigma_inc
+        self.sigma_dec = sigma_dec
+        self.eta = eta
+        self.alpha = alpha0
+        self.logfile = logfile
+        self.trajfile = trajfile
         self.forward_climb = True
 
-    def TS_BFGS(self, B_old, dF, dx):
+    def update_hessian(
+            self: None, B_old: np.ndarray,
+            dg: np.ndarray, dx: float
+            ) -> np.ndarray:
+        """
+        Hessian update procedure described by:
+
+        """
         eig, vec = LA.eigh(B_old)
+        print(eig)
         dxT = np.transpose(dx)
-        dFT = np.transpose(dF)
+        dgT = np.transpose(dg)
         B_abs = np.zeros(np.shape(self.hessian))
         for i in range(len(eig)):
-            B_abs += np.abs(eig[i]) * np.outer(vec[:,i], np.transpose(vec[:,i]))
+            B_abs += np.abs(eig[i]) * np.outer(vec[:, i], vec[:, i].T)
         dx_square = np.outer(dx, dxT)
-        dF_square = np.outer(dF, dFT)
-        M = dF_square + np.matmul(B_abs, np.matmul(dx_square, B_abs))
-        j = dF - np.matmul(B_old, dx)
-        u_term = 1/(np.matmul(dxT,np.matmul(M,dx)))
-        u = u_term * np.matmul(M, dx)
-        E_a = np.outer(u, np.transpose(j))
-        E_b = np.outer(j, np.transpose(u))
-        E_c = np.matmul(E_a, np.outer(dx, np.transpose(u)))
+        dg_square = np.outer(dg, dgT)
+        M = dg_square + mult(B_abs, mult(dx_square, B_abs))
+        j = dg - mult(B_old, dx)
+        u_term = 1/(mult(dxT, mult(M, dx)))
+        u = u_term * mult(M, dx)
+        E_a = np.outer(u, j.T)
+        E_b = np.outer(j, u.T)
+        E_c = mult(E_a, np.outer(dx, u.T))
         E = E_a + E_b - E_c
         B = B_old + E
         return B
 
-#    def TS_BFGS(self, B_old, dF, dx):
-#        eig, vec = LA.eigh(B_old)
-#        B_abs = mult(vec,mult(np.diag(np.abs(eig)),vec.T))
-#        denomterm1 = mult(dF.T,dx)
-#        denomterm2 = mult(dx.T,mult(B_abs,dx))
-#        denom = denomterm1**2 + denomterm2**2
-#        num1term1 = dF - mult(B_old,dx)
-#        num1term2 = np.transpose((denomterm1 * dF + denomterm2 * mult(B_abs,dx)))
-#        num1 = np.outer(num1term1,num1term2)
-#        num2 = np.outer(num1term2.T,num1term1.T)
-#        num3term1 = denomterm1-mult(dx.T,mult(B_old,dx))
-#        num3term2 = np.copy(num1term2.T)
-#        num3term3 = np.copy(num1term2)
-#        num3 = num3term1 * np.outer(num3term2,num3term3)
-#        correction = (1/denom) * (num1 + num2 - num3)
-#        B = B_old + correction
-#        return B
-
-
-    def ellipse_tangent_path(self,pos_1D):
+    def get_ellipse_tangent(self: None, pos_1D: np.ndarray) -> np.ndarray:
         """
         ellipse equation:
         (x/a)**2 + (y/b)**2 = 1
@@ -65,153 +84,227 @@ class SaddleClimb:
         """
         pos = pos_1D
         idx = self.indices
-        pos_i = self.atoms_initial.positions[idx,:].reshape(-1)
-        pos_f = self.atoms_final.positions[idx,:].reshape(-1)
+        pos_i = self.atoms_initial.positions[idx, :].reshape(-1)
+        pos_f = self.atoms_final.positions[idx, :].reshape(-1)
         y_vec = normalize(pos_f-pos_i)
-        x_vec = normalize(pos - np.dot(pos,y_vec) * y_vec)
+        x_vec = normalize(pos - np.dot(pos, y_vec) * y_vec)
         center = pos_i + 0.5 * (pos_f - pos_i)
         b = LA.norm(0.5*(pos_f-pos_i))
-        p1 = [0,b]
-        p2 = [0,-b]
-        p3 = [np.dot((pos-center),x_vec), np.dot((pos-center),y_vec)]
-        if np.abs(p3[0]) >= 1e-4 and np.abs(p3[1]) < b:     
-            a = np.abs(p3[0])/np.sqrt(1-(p3[1]/b)**2)
-            dydx = (-p3[0]*b**2)/(p3[1]*a**2)
+        p3 = [np.dot((pos-center), x_vec), np.dot((pos-center), y_vec)]
+        if np.abs(p3[0]) >= 1e-4 and np.abs(p3[1]) < b:
+            a = np.abs(p3[0]) / np.sqrt(1 - (p3[1] / b) ** 2)
+            dydx = (-p3[0] * b ** 2) / (p3[1] * a ** 2)
             path = normalize(dydx * y_vec + x_vec)
         else:
             path = normalize(pos_f-pos_i)
-        if np.dot(path,(pos_f-pos)) < 0:
+        if np.dot(path, (pos_f-pos)) < 0:
             path *= -1
         return path
 
-    def ascent_step(self, B, F, path):
+    def partition_hessian(self: None, B: np.ndarray,
+                        g: np.ndarray
+                        ) -> np.ndarray:
+
         eig, vec = LA.eigh(B)
-        print('eig: ', eig)
-        eig = np.abs(eig)
-        F_norm = normalize(F)
-        uphill_vec=np.zeros(np.shape(vec))
+        g_norm = normalize(g)
+        uphill_vec = np.zeros(np.shape(vec))
         for i in range(len(eig)):
-            sign = np.sign(np.dot(vec[:,i],-1*F_norm))
-            uphill_vec[:,i] = sign * vec[:,i]
+            sign = np.sign(np.dot(vec[:, i], g_norm))
+            uphill_vec[:, i] = sign * vec[:, i]
+        uphill_vec_path_dot = mult(uphill_vec.T, self.path)
+        if self.forward_climb:
+            maxdot = np.max(uphill_vec_path_dot)
+            eigidx = np.where(np.isclose(uphill_vec_path_dot,maxdot))
+        else:
+            mindot = np.min(uphill_vec_path_dot)
+            eigidx = np.where(np.isclose(uphill_vec_path_dot,mindot))
+        climb_vec = vec[:,eigidx[0][0]]
+        descend_idx = [val for val in range(len(vec)) if val != eigidx[0][0]]
+        descend_vec = vec[:,descend_idx]
+        return climb_vec, descend_vec
 
-        uphill_vec_path_dot=np.matmul(uphill_vec.T, path)
-#        if self.forward_climb:
-#            max_val = np.max(uphill_vec_path_dot)
-#            eig_idx = np.where(uphill_vec_path_dot == max_val)
-#        else:
-#            min_val = np.min(uphill_vec_path_dot)
-#            eig_idx = np.where(uphill_vec_path_dot == min_val)
-#        eig[eig_idx] *= -1
-#        print('eig_idx: ', eig_idx)
+    def get_s(self, vec_min, vec_max, g, B, a):
+        """ PRFO from Sella paper"""
+        vBv_min = mult(vec_min.T, mult(B, vec_min))
+        vBv_max = mult(vec_max.T, mult(B, vec_max))
+        M_min = np.zeros([len(vBv_min)+1, len(vBv_min)+1])
+        M_max = np.zeros([2, 2])
+        M_min[0:-1,0:-1]= a ** 2 * vBv_min
+        M_min[-1,0:-1] = a * mult(g.T, vec_min)
+        M_min[0:-1,-1] = a * mult(vec_min.T, g)
+        M_max[0,0]= a ** 2 * vBv_max
+        M_max[1,0] = a * mult(g.T, vec_max)
+        M_max[0,1] = a * mult(vec_max.T, g)
+        scale_min = 1 / LA.eigh(M_min)[1][-1,0]
+        scale_max = 1 / LA.eigh(M_max)[1][1,1]
+        s_max = a * scale_max * LA.eigh(M_max)[1][0,1]
+        s_min = a * scale_min * LA.eigh(M_min)[1][0:-1,0]
+        #print('last entries are 1??: ', scale_max, scale_min)
+        sk = s_max * vec_max + mult(vec_min, s_min) 
+        return sk
 
-        max_diff = 0 #np.sqrt(1/len(eig))
-        #found_uphill=False
-        for i in range(len(eig)):
-            if self.forward_climb and uphill_vec_path_dot[i] > max_diff:
-                eig[i] *= -1
-        #        found_uphill = True
-                break
-            elif not self.forward_climb and uphill_vec_path_dot[i] < -max_diff:
-                eig[i] *= -1
-       #         found_uphill = True
-                break
-        eig[i] = scale_climb(eig[i], vec[i], F)
-        #print('Found uphill?: ',found_uphill)
-        H_step = np.matmul(vec,np.matmul(np.diag(eig),LA.inv(vec)))
-        step = -1 * np.matmul(LA.inv(H_step), -1*F)
+    def correct_step(self, step):
+        if self.forward_climb and np.dot(step, self.path) < 0:
+            step = project_out(step, self.path)
+        elif not self.forward_climb and np.dot(step, self.path) > 0:
+            step = project_out(step, self.path)
         return step
 
-    def descent_step(self, B, F):
-        eig, vec = LA.eigh(B)
-        eig = np.abs(eig)
-        H_step = np.matmul(vec,np.matmul(np.diag(eig),LA.inv(vec)))
-        step = np.matmul(LA.inv(H_step), F)
-        return step
 
-    def take_step(self,atoms,dx):
-        if np.max(np.abs(dx)) > 0.1:
-            scale = 0.1/np.max(np.abs(dx))
-            dx *= scale
-        idx = self.indices
-        atoms.positions[idx,:] += dx
-        return atoms, dx
+    def optimize_a(self, a, vec_min, vec_max, g, B):
+        step = self.get_s(vec_min, vec_max, g, B, a)
+        norm = LA.norm(step)
+        length = np.sqrt(len(g)) * self.delta 
+        diff = norm - length
+        return diff
 
-    def test_run(self):
-        traj = Trajectory('SaddleClimb.traj','w')
+    def assess_trust_radius(self, dx, dE, g, B):
+        pred = mult(g.T, dx) + 0.5 * mult(dx.T, mult(B, dx))
+        rho = dE / pred
+        rho_between = rho > 1 / self.rho_inc and rho < self.rho_inc
+        rho_outside = rho < 1 / self.rho_dec or rho > self.rho_dec
+        length = np.sqrt(len(g)) * self.delta
+        l_min = np.sqrt(len(g)) * self.eta
+        if rho_between and self.sigma_inc * LA.norm(dx) >= length:
+            self.delta = self.sigma_inc * LA.norm(dx) / np.sqrt(len(g))
+        elif rho_outside and self.sigma_dec * LA.norm(dx) > l_min:
+            self.delta = self.sigma_dec * LA.norm(dx) / np.sqrt(len(g))
+        elif rho_outside and self.sigma_dec * LA.norm(dx) < l_min:
+            self.delta = self.eta
+        print('rho is: ', rho)
+        return
+
+    def initialize_atoms(self: None) -> tuple[Atoms, np.ndarray, np.ndarray]:
         atoms = self.atoms_initial.copy()
         constraints = self.atoms_initial.constraints.copy()
         atoms.set_constraint(constraints)
         atoms.calc = self.calculator
         idx = self.indices
-        F_calc = atoms.get_forces()
-        F = F_calc[idx,:]
+        B_init = self.hessian
+        return atoms, idx, B_init
+
+    def initialize_run(self: None, atoms: Atoms, idx: list) -> np.ndarray:
+        traj = Trajectory(self.trajfile, 'w')
+        g_init = atoms.get_forces()[idx, :].reshape(-1)
+        E_init = atoms.calc.results['energy']
         traj.write(atoms)
-        B = self.hessian
-        pos_f_1D = self.atoms_final.positions[idx,:].reshape(-1)
-        pos_i_1D = self.atoms_initial.positions[idx,:].reshape(-1)
-        dx_1D = 0.01 * normalize(pos_f_1D-pos_i_1D)
-        dx = dx_1D.reshape(-1,3)
-        Fmax = 1
-        dxi = 0
-        n = 0
+        Fmax = np.max(np.abs(g_init))
+        log_string = self.get_log_string(0, E_init, Fmax)
+        self._log(log_string)
+        return traj, g_init, E_init
+
+    def get_initial_step(
+            self: None, idx: list
+            ) -> tuple[np.ndarray, np.ndarray]:
+
+        pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
+        pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
+        multiplier = np.sqrt(len(pos_i_1D) * self.delta ** 2)
+        dx_1D = multiplier * normalize(pos_f_1D - pos_i_1D)
+        dx_init = dx_1D.reshape(-1, 3)
+        return dx_init, pos_i_1D
+
+    def check_climb_direction(self: None, g: np.ndarray,
+                              Fmax: float, dxi: float
+                              ) -> None:
+        g_path_dot = np.dot(g, self.path)
+        if Fmax < self.fmax and dxi < 0.1:
+            pass
+        elif g_path_dot > 0:
+            self.forward_climb = True
+        else:
+            self.forward_climb = False
+
+    def get_log_string(self,n,E,Fmax):
+        n_str = str(n).ljust(20)
+        E_str = str(np.round(E,6)).ljust(20)
+        F_str = str(np.round(Fmax,6)).ljust(20)
+        if self.forward_climb:
+            climb = 'forward'
+        else:
+            climb = 'reverse'
+        log_string = n_str + E_str + F_str + climb
+        return log_string
+
+    def _log(self: None, string: str) -> None:
+        if self.logfile is None:
+            print(string)
+        else:
+            with open(self.logfile,'a') as log:
+                log.write(string + '\n')
+        sys.stdout.flush()
+
+    def initialize_logging(self: None):
+        n_str = 'Iteration'.ljust(20)
+        E_str = 'Energy (eV)'.ljust(20)
+        F_str = 'Fmax (eV/A)'.ljust(20)
+        climb = 'Climbing Direction'
+        log_string = n_str + E_str + F_str + climb
+        climb = Path(self.logfile)
+        if climb.exists():
+            os.remove(self.logfile)
+        self._log(log_string)
+
+    def run(self: None) -> None:
+        atoms, idx, B = self.initialize_atoms()
+        self.initialize_logging()
+        traj, g, E = self.initialize_run(atoms, idx)
+        dx, pos_i_1D = self.get_initial_step(idx)
+        dx_1D = dx.reshape(-1)
+        Fmax, dxi, n = 1, 0, 0
         while Fmax > self.fmax or dxi < 0.5:
             n += 1
-            atoms, dx = self.take_step(atoms,dx)
-            pos_1D = atoms.positions[idx,:].reshape(-1)
-            path = self.ellipse_tangent_path(pos_1D)
-            write_path(atoms,idx, path, 'path_{}.traj'.format(str(n)))
-            dxi = LA.norm(pos_i_1D-pos_1D)
-            print('distance to initial position:\n', dxi)
-            F0 = F
-            F_calc = atoms.get_forces()
-            F = F_calc[idx,:]
-            dF = (F-F0)
-            Fmax = np.max(np.abs(F))
-            print('Fmax\n', Fmax)
-            traj.write(atoms)
+            atoms.positions[idx, :] += dx
+            pos_1D = atoms.positions[idx, :].reshape(-1)
+            self.path = self.get_ellipse_tangent(pos_1D)
+            self.write_path(atoms, idx, 'path_{}.traj'.format(str(n)))
+            dxi = LA.norm(pos_i_1D - pos_1D)
+            g0, E0 = g, E
+            g = -atoms.get_forces()[idx, :].reshape(-1)
+            E = atoms.calc.results['energy']
+            dg, dE = (g - g0), (E - E0)
+            Fmax = np.max(np.abs(g))
+            self.assess_trust_radius(dx_1D, dE, g0, B) 
+            self.check_climb_direction(g, Fmax, dxi)
+            B = self.update_hessian(B, dg, dx_1D)
+            vec_max, vec_min = self.partition_hessian(B, g)
+            self.alpha = 0.05
+            dx_1D = self.get_s(vec_min, vec_max, g, B, self.alpha)
+            #dx_1D = self.correct_step(dx_1D)
+            max_l = np.sqrt(len(dx_1D) * self.delta ** 2)
 
-            rev_dot = np.dot(F.reshape(-1), -1*path)
-            if Fmax < self.fmax and dxi < 0.1:
-                pass
-            elif rev_dot > 0:
-                self.forward_climb = True
-            else:
-                self.forward_climb = False
-            print('self.forward_climb?: ', self.forward_climb)
-            B = self.TS_BFGS(B, -1*dF.reshape(-1), dx.reshape(-1))
-            path_F_dot = np.abs(np.dot(path, normalize(F.reshape(-1))))
-            print('path_F_dot: ',path_F_dot)
-#            if path_F_dot < 0.1:
-#                F_proj = project_out(F.reshape(-1),path)
-#                dx_1D = self.descent_step(B, F_proj)
-#            else:
-            dx_1D = self.ascent_step(B, F.reshape(-1), path)
-            dx = dx_1D.reshape(-1,3)
-            sys.stdout.flush()
+            if LA.norm(dx_1D) > max_l:
+                args = vec_min, vec_max, g, B
+                a_sol = scipy.optimize.root(self.optimize_a, self.alpha, args)
+                self.alpha = a_sol.x
+                dx_1D = self.get_s(vec_min, vec_max, g, B, self.alpha) 
+            print('dx norm: ', LA.norm(dx_1D))
+            print('alpha: ', self.alpha)
+            print('delta: ', self.delta)
+            #dx_1D = self.correct_step(dx_1D)
+            #print('corrected dx norm: ', LA.norm(dx_1D))
+            
+            dx = dx_1D.reshape(-1, 3)
+            log_string = self.get_log_string(n,E,Fmax)
+            self._log(log_string)
+            traj.write(atoms) 
 
-def scale_climb(eig, vec, F):
-    g = np.dot(vec, -1*F)
-    step_len = np.abs((1/eig) * LA.norm(g))
-    if step_len > 0.1:
-        scale = 0.1 / step_len
-        print('scale of eig: ',1/scale)
-        eig *= 1/scale
-    return eig
+    def write_path(self: None, atoms: Atoms, idx: list, name: str) -> None:
+        path_traj = Trajectory(name, 'w')
+        points = 0.6 * np.sin(np.linspace(0, 2*np.pi, 30))
+        for point in points:
+            atoms_cpy = atoms.copy()
+            disp = point * self.path
+            atoms_cpy.positions[idx, :] += disp.reshape(-1, 3)
+            path_traj.write(atoms_cpy)
 
-def normalize(v):
+def normalize(v: np.ndarray) -> np.ndarray:
     norm = LA.norm(v)
     return v / norm
 
-def project_out(vec,direction):
-    mag = np.dot(vec,direction)
+def project_out(vec: np.ndarray, direction: np.ndarray) -> np.ndarray:
+    mag = np.dot(vec, direction)
     new_vec = vec - mag * direction
-    return vec
+    return new_vec
 
-def write_path(atoms,idx,path,name):
-    path_traj = Trajectory(name,'w')
-    points = 0.6 * np.sin(np.linspace(0,2*np.pi,30))    
-    for point in points:
-        atoms_cpy = atoms.copy()
-        disp = point * path
-        atoms_cpy.positions[idx,:] += disp.reshape(-1,3)
-        path_traj.write(atoms_cpy)
+
