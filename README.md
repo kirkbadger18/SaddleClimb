@@ -1,8 +1,8 @@
 # SaddleClimb:
-## A path constrained minimum mode following saddle point search algorithm
+## A path constrained mode following saddle point search algorithm
 
 This method combines the advantages of both single and double ended search methods for finding first order saddle points that connect
-reactive intermedieates to one another. The atoms corresponding to an initial state are slowly stepped uphill along the minimum mode which has a positive
+reactive intermediates to one another. The atoms corresponding to an initial state are slowly stepped uphill along the mode which has the largest
 dot product with the reaction path. This path is not known exactly, but instead is fitted to the equation of an ellipse, where the verticies correspond to the initial and final states of the reaction. This method uses the final state coordinates to impose a path to guide the molecule uphill and towards the final state, but never constructs a string as other double ended methods to. This makes this method much faster, while retaining the robustness of a double
 ended method.
 
