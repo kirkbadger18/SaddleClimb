@@ -19,35 +19,54 @@ Lastly restart your shell, or source your `~/.bashrc`
 
 ## How to Use
 This tool is meant to be used in combination with the Atomic Simulation Environment (ASE), so make sure that is installed. First you will need to have 
-geometry files for the initial and final states of your reaction. Then you can use Saddleclimb to search for the first order saddle point connecting the two. As an example I have optimised a hydrogen adatom on Pt(111) in both the atop and fcc site, then used saddleclimb to find the saddlepoint connecting the two. Below is an example of how saddleclimb was used.
+geometry files for the initial and final states of your reaction. Then you can use Saddleclimb to search for the first order saddle point connecting the two. As an example I have an initial state with *CH on Pt(111) and a final state where the *CH has dissociated to form *C and *H. I then used saddleclimb to find the first order saddle point connecting the two. Below is an example of how saddleclimb was used.
 
 ```python
 from ase import Atoms, Atom
 from ase.io import read
-from ase.calculators.vasp import Vasp
 from saddleclimb import SaddleClimb
+from ase.calculators.espresso import Espresso, EspressoProfile
+from saddleclimb_test import SaddleClimb
+from ase.calculators.emt import EMT
 
-calc=Vasp(xc='beef-vdw',
-	encut=680.29, 
-	luse_vdw=True,
-	zab_vdw=-1.8867,
-	kpts=(5,5,1),
-	ismear=1,
-	sigma=0.1,
-	ibrion=-1,
-	ispin=1,
-	algo='Fast',
-	lreal='Auto',
-	ediff=1e-5,
-	isym=0,
-    ) 
+pwx = '/oscar/runtime/software/external/quantum-espresso/7.1-git/bin/pw.x'
+profile = EspressoProfile(
+    command='mpirun -n 96 --bind-to core {}'.format(pwx),
+    pseudo_dir='/users/kbadger1/espresso/pseudo/pslibrary.1.0.0/pbe/PSEUDOPOTENTIALS/',
+)
 
-init=read('../../../minimizations/atop/opt.traj')
-final=read('../../../minimizations/hcp/opt.traj')
+input_data = dict(
+        input_dft='beef-vdw',
+        occupations='smearing',
+        smearing='marzari-vanderbilt',
+        degauss=0.02,
+        ecutwfc=40, #opt setting
+        ecutrho = 410,
+        nosym=True,
+        nspin=1,
+        mixing_mode='local-TF',
+        tprnfor=True,
+        )
 
-idx = list(range(18,37))
+calc = Espresso(
+                pseudopotentials=dict(
+                                    Pt='Pt.pbe-n-kjpaw_psl.1.0.0.UPF',
+                                    C='C.pbe-n-kjpaw_psl.1.0.0.UPF',
+                                    O='O.pbe-nl-kjpaw_psl.1.0.0.UPF',
+                                    H='H.pbe-kjpaw_psl.1.0.0.UPF',
+                                    N='N.pbe-n-kjpaw_psl.1.0.0.UPF',),
+                input_data=input_data,
+                profile=profile,
+                kpts=(5, 5, 1), #opt setting
+
+                )
+
+init=read('../../minimizations/init/opt.traj')
+final=read('../../minimizations/final/opt.traj')
+idx = list(range(18,38))
+
 climber = SaddleClimb(init, final, calc, idx)
-climber.test_run()
+climber.run()
 ```
 
-To see more details refer to this example and others in the [example](https://github.com/kirkbadger18/SaddleClimb/tree/local/example) folder
+To see more details refer to this example and others in the [example](https://github.com/kirkbadger18/SaddleClimb/tree/main/examples/CH_to_C_H) folder
