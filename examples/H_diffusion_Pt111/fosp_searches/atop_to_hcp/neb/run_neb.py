@@ -32,6 +32,7 @@ for i in range(7):
         nspin=1,
         mixing_mode='local-TF',
         tprnfor=True,
+        conv_thr=1e-8,
         )
 
     calc = Espresso(

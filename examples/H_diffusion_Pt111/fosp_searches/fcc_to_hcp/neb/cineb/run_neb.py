@@ -6,7 +6,9 @@ from ase.optimize import BFGS
 from ase.io import read,write
 from ase.mep import interpolate,NEB
 
-
+#init=read('../../../minimizations/fcc/opt.traj')
+#final=read('../../../minimizations/atop/opt.traj')
+#images = [init]
 images=read('../neb.traj@-9:')
 
 
@@ -29,6 +31,7 @@ for i in range(7):
         nspin=1,
         mixing_mode='local-TF',
         tprnfor=True,
+        conv_thr=1e-8,
         )
 
     calc = Espresso(
@@ -47,5 +50,5 @@ for i in range(7):
     images[i+1].calc = calc
     
 neb=NEB(images,climb=True)
-dyn = BFGS(neb, trajectory='neb.traj', logfile='neb.log')
+dyn = BFGS(neb, trajectory='cineb.traj', logfile='cineb.log')
 dyn.run(fmax=0.01)

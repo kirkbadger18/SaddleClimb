@@ -33,7 +33,7 @@ class SaddleClimb:
         self.atoms_initial = atoms_initial
         self.atoms_final = atoms_final
         self.indices = indices
-        self.hessian = 70 * np.eye(3*len(self.indices))
+        self.hessian = 100 * np.eye(3*len(self.indices))
         self.calculator = calculator
         self.fmax = fmax
         self.delta = delta0
@@ -75,7 +75,7 @@ class SaddleClimb:
         B = B_old + E
         return B
 
-    def get_ellipse_tangent(self: None, pos_1D: np.ndarray) -> np.ndarray:
+    def get_ellipse_tangent(self: None, pos_1D: np.ndarray, g) -> np.ndarray:
         """
         ellipse equation:
         (x/a)**2 + (y/b)**2 = 1
@@ -89,16 +89,29 @@ class SaddleClimb:
         y_vec = normalize(pos_f-pos_i)
         x_vec = normalize(pos - np.dot(pos, y_vec) * y_vec)
         center = pos_i + 0.5 * (pos_f - pos_i)
-        b = LA.norm(0.5*(pos_f-pos_i))
-        p3 = [np.dot((pos-center), x_vec), np.dot((pos-center), y_vec)]
-        if np.abs(p3[0]) >= 1e-4 and np.abs(p3[1]) < b:
-            a = np.abs(p3[0]) / np.sqrt(1 - (p3[1] / b) ** 2)
+        p1 = np.array([0, np.dot((pos_i-center), y_vec)])
+        p2 = np.array([0, np.dot((pos_f-center), y_vec)])
+        p3 = np.array([np.dot((pos-center), x_vec), np.dot((pos-center), y_vec)])
+        l1 = LA.norm(p3 - p1)
+        l2 = LA.norm(p3 - p2)
+        print('p1, p2, p3: ',p1, p2, p3)
+        vert1 = np.array([0,p2[1] - (l1 + l2)]) 
+        vert2 = np.array([0,p1[1] + (l1 + l2)])
+        b = 0.5 * (vert2-vert1)[1]
+               #if np.abs(p3[0]) >= 1e-4 and np.abs(p3[1]) < b:
+        if np.abs(p3[1] - b) > 1e-4:
+            a= np.abs(p3[0]) / np.sqrt(1 - (p3[1] / b) ** 2)
             dydx = (-p3[0] * b ** 2) / (p3[1] * a ** 2)
             path = normalize(dydx * y_vec + x_vec)
+            print('p3, a, b', p3, a, b)
+            print('dydx: ',dydx)
         else:
             path = normalize(pos_f-pos_i)
-        if np.dot(path, (pos_f-pos)) < 0:
-            path *= -1
+        for i in range(int(len(pos)/3)):
+            atom_path = path[3*i:3*i+3]
+            atom_g = g[3*i:3*i+3]
+            if np.dot(atom_path, atom_g) < 0:
+                path[3*i:3*i+3] *= -1
         return path
 
     def partition_hessian(self: None, B: np.ndarray,
@@ -112,12 +125,19 @@ class SaddleClimb:
             sign = np.sign(np.dot(vec[:, i], g_norm))
             uphill_vec[:, i] = sign * vec[:, i]
         uphill_vec_path_dot = mult(uphill_vec.T, self.path)
-        if self.forward_climb:
-            maxdot = np.max(uphill_vec_path_dot)
-            eigidx = np.where(np.isclose(uphill_vec_path_dot,maxdot))
-        else:
-            mindot = np.min(uphill_vec_path_dot)
-            eigidx = np.where(np.isclose(uphill_vec_path_dot,mindot))
+        #mindot = 1/np.sqrt(len(eig))
+        #for i in range(len(eig)):
+            #if self.forward_climb and uphill_vec_path_dot[i] > mindot:
+            #if uphill_vec_path_dot[i] > mindot:
+        maxdot = np.max(uphill_vec_path_dot)
+        eigidx = np.where(np.isclose(uphill_vec_path_dot,maxdot))
+                #eigidx = i
+                #break
+            #elif not self.forward_climb and uphill_vec_path_dot[i] < -mindot:
+                #mindot = np.min(uphill_vec_path_dot)
+                #eigidx = np.where(np.isclose(uphill_vec_path_dot,mindot))
+                #eigidx = i
+                #break
         climb_vec = vec[:,eigidx[0][0]]
         descend_idx = [val for val in range(len(vec)) if val != eigidx[0][0]]
         descend_vec = vec[:,descend_idx]
@@ -207,8 +227,14 @@ class SaddleClimb:
     def check_climb_direction(self: None, g: np.ndarray,
                               Fmax: float, dxi: float
                               ) -> None:
+        idx = self.indices
+        pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
+        pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
+        dist = LA.norm(pos_f_1D - pos_i_1D)
         g_path_dot = np.dot(g, self.path)
-        if Fmax < self.fmax and dxi < 0.1:
+        print('dxi, dist = ', dxi, dist)
+        #if Fmax < self.fmax and dxi < 0.1:
+        if dxi < 0.1 * dist:
             pass
         elif g_path_dot > 0:
             self.forward_climb = True
@@ -219,11 +245,11 @@ class SaddleClimb:
         n_str = str(n).ljust(20)
         E_str = str(np.round(E,6)).ljust(20)
         F_str = str(np.round(Fmax,6)).ljust(20)
-        if self.forward_climb:
-            climb = 'forward'
-        else:
-            climb = 'reverse'
-        log_string = n_str + E_str + F_str + climb
+        #if self.forward_climb:
+        #    climb = 'forward'
+        #else:
+        #    climb = 'reverse'
+        log_string = n_str + E_str + F_str # + climb
         return log_string
 
     def _log(self: None, string: str) -> None:
@@ -256,30 +282,30 @@ class SaddleClimb:
             n += 1
             atoms.positions[idx, :] += dx
             pos_1D = atoms.positions[idx, :].reshape(-1)
-            self.path = self.get_ellipse_tangent(pos_1D)
-            self.write_path(atoms, idx, 'path_{}.traj'.format(str(n)))
             dxi = LA.norm(pos_i_1D - pos_1D)
             g0, E0 = g, E
             g = -atoms.get_forces()[idx, :].reshape(-1)
             E = atoms.calc.results['energy']
             dg, dE = (g - g0), (E - E0)
             Fmax = np.max(np.abs(g))
-            self.assess_trust_radius(dx_1D, dE, g0, B) 
-            self.check_climb_direction(g, Fmax, dxi)
+            self.assess_trust_radius(dx_1D, dE, g0, B)
+            self.path = self.get_ellipse_tangent(pos_1D, g)
+            self.write_path(atoms, idx, 'path_{}.traj'.format(str(n)))
+            #self.check_climb_direction(g, Fmax, dxi)
             B = self.update_hessian(B, dg, dx_1D)
             vec_max, vec_min = self.partition_hessian(B, g)
-            self.alpha = 0.05
-            dx_1D = self.get_s(vec_min, vec_max, g, B, self.alpha)
+            a = 1
+            dx_1D = self.get_s(vec_min, vec_max, g, B, a)
             #dx_1D = self.correct_step(dx_1D)
             max_l = np.sqrt(len(dx_1D) * self.delta ** 2)
 
             if LA.norm(dx_1D) > max_l:
                 args = vec_min, vec_max, g, B
-                a_sol = scipy.optimize.root(self.optimize_a, self.alpha, args)
-                self.alpha = a_sol.x
-                dx_1D = self.get_s(vec_min, vec_max, g, B, self.alpha) 
+                a_sol = scipy.optimize.root(self.optimize_a, a, args)
+                a = a_sol.x
+                dx_1D = self.get_s(vec_min, vec_max, g, B, a) 
             print('dx norm: ', LA.norm(dx_1D))
-            print('alpha: ', self.alpha)
+            print('alpha: ', a)
             print('delta: ', self.delta)
             #dx_1D = self.correct_step(dx_1D)
             #print('corrected dx norm: ', LA.norm(dx_1D))

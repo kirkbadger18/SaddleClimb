@@ -2,7 +2,7 @@ from ase import Atoms, Atom
 from ase.io import read
 from saddleclimb import SaddleClimb
 from ase.calculators.espresso import Espresso, EspressoProfile
-from saddleclimb_test import SaddleClimb
+from saddleclimb import SaddleClimb
 from ase.calculators.emt import EMT
 
 pwx = '/oscar/runtime/software/external/quantum-espresso/7.1-git/bin/pw.x'
@@ -22,6 +22,7 @@ input_data = dict(
         nspin=1,
         mixing_mode='local-TF',
         tprnfor=True,
+        conv_thr=1e-8,
         )
 
 calc = Espresso(
