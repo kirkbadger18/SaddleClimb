@@ -2,7 +2,7 @@ from ase import Atoms, Atom
 from ase.io import read
 from saddleclimb import SaddleClimb
 from ase.calculators.espresso import Espresso, EspressoProfile
-from saddleclimb import SaddleClimb
+from saddleclimb_test import SaddleClimb
 from ase.calculators.emt import EMT
 
 pwx = '/oscar/runtime/software/external/quantum-espresso/7.1-git/bin/pw.x'
@@ -15,7 +15,7 @@ input_data = dict(
         input_dft='beef-vdw',
         occupations='smearing',
         smearing='marzari-vanderbilt',
-        degauss=0.02,
+        degauss=0.001,
         ecutwfc=40, #opt setting
         ecutrho = 410,
         nosym=True,
@@ -38,6 +38,7 @@ calc = Espresso(
 
                 )
 
+#calc = EMT()
 init=read('../../minimizations/init/opt.traj')
 final=read('../../minimizations/final/opt.traj')
 idx = list(range(18,38))

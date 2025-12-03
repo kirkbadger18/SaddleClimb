@@ -25,7 +25,7 @@ for i in range(7):
         input_dft='beef-vdw',
         occupations='smearing',
         smearing='marzari-vanderbilt',
-        degauss=0.02,
+        degauss=0.001,
         ecutwfc=40, #opt setting
         ecutrho = 410,
         nosym=True,

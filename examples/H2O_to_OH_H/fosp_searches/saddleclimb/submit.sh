@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=48
 #SBATCH --constraint=48core
 #SBATCH --mem=96G
-##SBATCH --account=cfgoldsm-condo
+#SBATCH --account=cfgoldsm-condo
 
 
 source /users/kbadger1/anaconda3/etc/profile.d/conda.sh

@@ -18,7 +18,7 @@ input_data = dict(
         input_dft='beef-vdw',
         occupations='smearing',
         smearing='marzari-vanderbilt',
-        degauss=0.02,
+        degauss=0.001,
         ecutwfc=40, #opt setting
         ecutrho = 410,
         nosym=True,
@@ -42,4 +42,4 @@ calc = Espresso(
 
 C.calc = calc
 dyn = BFGS(C, trajectory='opt.traj')
-dyn.run(fmax=0.01)
+dyn.run(fmax=0.001)
