@@ -46,10 +46,10 @@ class SaddleClimb:
            print('descending')
        else:
            climb_dir = dxi_to_f.copy()
-           for i in range(len(self.indices)):
-               tmpdot = np.dot(-g[3*i:3*i+3], climb_dir[3*i:3*i+3])
-               if tmpdot > 0:
-                   climb_dir[3*i:3*i+3] *= -1
+           #for i in range(len(self.indices)):
+           #    tmpdot = np.dot(-g[3*i:3*i+3], climb_dir[3*i:3*i+3])
+           #    if tmpdot > 0:
+           #        climb_dir[3*i:3*i+3] *= -1
            new_eig_vecs, R =  LA.qr(climb_dir.reshape(len(climb_dir),1),
                                     mode = 'complete')
            Dtmp = mult(new_eig_vecs.T, mult(B, new_eig_vecs))
@@ -159,16 +159,11 @@ class SaddleClimb:
         self._log(log_string)
 
     def _get_F(self, atoms):
-        got_f = False
-        while not got_f:
-            try:
-                time.sleep(5)
-                print('trying')
-                f = atoms.get_forces()
-                time.sleep(5)
-                got_f = True
-            except:
-                print('failed job, trying again')
+        try:
+            f = atoms.get_forces()
+        except:
+            print('could not compute forces')
+            raise Exception('forces not able to be computed')
         return f
 
 

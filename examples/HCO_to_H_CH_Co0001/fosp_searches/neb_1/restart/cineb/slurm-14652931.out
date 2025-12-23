@@ -1,0 +1,56 @@
+## SLURM PROLOG ###############################################################
+##    Job ID : 14652931
+##  Job Name : HXCO_NEB
+##  Nodelist : node[1923,1931]
+##      CPUs : 96
+##  Mem/Node : 98304 MB
+## Directory : /oscar/scratch/kbadger1/SaddleClimb/examples/HCO_to_H_CH_Co0001/fosp_searches/neb_1/restart/cineb
+##   Job Started : Sun Nov 30 03:56:55 PM EST 2025
+###############################################################################
+Traceback (most recent call last):
+  File "/oscar/scratch/kbadger1/SaddleClimb/examples/HCO_to_H_CH_Co0001/fosp_searches/neb_1/restart/cineb/run_neb.py", line 56, in <module>
+    dyn.run(fmax=0.01)
+    ~~~~~~~^^^^^^^^^^^
+  File "/users/kbadger1/anaconda3/envs/ase/lib/python3.13/site-packages/ase/optimize/optimize.py", line 415, in run
+    return Dynamics.run(self, steps=steps)
+           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "/users/kbadger1/anaconda3/envs/ase/lib/python3.13/site-packages/ase/optimize/optimize.py", line 284, in run
+    for converged in Dynamics.irun(self, steps=steps):
+                     ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "/users/kbadger1/anaconda3/envs/ase/lib/python3.13/site-packages/ase/optimize/optimize.py", line 259, in irun
+    self.log()
+    ~~~~~~~~^^
+  File "/users/kbadger1/anaconda3/envs/ase/lib/python3.13/site-packages/ase/optimize/optimize.py", line 425, in log
+    forces = self.optimizable.get_forces()
+  File "/users/kbadger1/anaconda3/envs/ase/lib/python3.13/site-packages/ase/mep/neb.py", line 266, in get_forces
+    return self.neb.get_forces()
+           ~~~~~~~~~~~~~~~~~~~^^
+  File "/users/kbadger1/anaconda3/envs/ase/lib/python3.13/site-packages/ase/mep/neb.py", line 730, in get_forces
+    forces = super().get_forces()
+  File "/users/kbadger1/anaconda3/envs/ase/lib/python3.13/site-packages/ase/mep/neb.py", line 450, in get_forces
+    forces[i - 1] = images[i].get_forces()
+                    ~~~~~~~~~~~~~~~~~~~~^^
+  File "/users/kbadger1/anaconda3/envs/ase/lib/python3.13/site-packages/ase/atoms.py", line 827, in get_forces
+    forces = self._calc.get_forces(self)
+  File "/users/kbadger1/anaconda3/envs/ase/lib/python3.13/site-packages/ase/calculators/abc.py", line 30, in get_forces
+    return self.get_property('forces', atoms)
+           ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/users/kbadger1/anaconda3/envs/ase/lib/python3.13/site-packages/ase/calculators/calculator.py", line 538, in get_property
+    self.calculate(atoms, [name], system_changes)
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/users/kbadger1/anaconda3/envs/ase/lib/python3.13/site-packages/ase/calculators/genericfileio.py", line 333, in calculate
+    atoms=atoms,
+  File "/users/kbadger1/anaconda3/envs/ase/lib/python3.13/site-packages/ase/calculators/espresso.py", line 87, in execute
+    profile.run(directory, self.inputname, self.outputname,
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                errorfile=self.errorname)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/users/kbadger1/anaconda3/envs/ase/lib/python3.13/site-packages/ase/calculators/genericfileio.py", line 101, in run
+    for i in range(3):
+    ^^^^^^^^^^^^^^^^^^
+    ...<5 lines>...
+                stderr=fd_err,
+    
+  File "/users/kbadger1/anaconda3/envs/ase/lib/python3.13/subprocess.py", line 419, in check_call
+    raise CalledProcessError(retcode, cmd)
+subprocess.CalledProcessError: Command '['mpirun', '-np', '96', '--bind-to', 'core', '/oscar/runtime/software/external/quantum-espresso/7.1-git/bin/pw.x', '-in', 'espresso.pwi']' returned non-zero exit status 1.
