@@ -123,7 +123,7 @@ class SaddleClimb:
 
         self._pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
         self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
-        dx_1D = self.delta * normalize(self._pos_f_1D - self._pos_i_1D)
+        dx_1D = self.delta * self.normalize(self._pos_f_1D - self._pos_i_1D)
         dx_init = dx_1D.reshape(-1, 3)
         return dx_init
 
@@ -184,7 +184,6 @@ class SaddleClimb:
             self._log(log_string)
             traj.write(atoms)
 
-
-def normalize(v: np.ndarray) -> np.ndarray:
-    norm = LA.norm(v)
-    return v / norm
+    def normalize(self: None, v: np.ndarray) -> np.ndarray:
+        norm = LA.norm(v)
+        return v / norm
