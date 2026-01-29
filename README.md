@@ -57,4 +57,5 @@ Iteration           Energy (eV)         Fmax (eV/A)
 19                  7.211657            0.009406
 ```
 And climb.traj can be opened with `ase gui` and shows the geometry and energy of each step. The energy profiles typically look like:
+
 <img width="1.5*294" height="1.5*191" alt="image" src="https://github.com/user-attachments/assets/57b35f13-9522-4236-b008-6b5060f946ed" />
