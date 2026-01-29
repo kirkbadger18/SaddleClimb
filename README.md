@@ -14,7 +14,7 @@ Then activate your virtual environment of choice containing ASE, enter the repos
 `pip install ./`
 
 ## How to Use
-This tool is meant to be used in combination with the Atomic Simulation Environment (ASE). It will take in ASE Atoms objects and ASE calculator objects. To instantiate a SaddleClimb object you will need an initial state (optimized), and a final state (also optimized), a calculator, and a list of the indicies of the atoms which will be moving throughout the reaction. The The initial and final states are ASE Atoms objects, the calculator is an ASE calculator object, and the list of indicies is just a python list of integers. The following section of code is an example of how this would be set up for the diffusion of a carbon adatom from one site to another using the EMT calculator.
+This tool is meant to be used in combination with the Atomic Simulation Environment (ASE). It will take in ASE Atoms objects and ASE calculator objects. To instantiate a SaddleClimb object you will need an initial state (optimized), and a final state (also optimized), a calculator, and a list of the indicies of the atoms which will be moving throughout the reaction. The initial and final states are ASE Atoms objects, the calculator is an ASE calculator object, and the list of indicies is just a python list of integers. The following section of code is an example of how this would be set up for the diffusion of a carbon adatom from one site to another using the EMT calculator.
 
 ```python
 from ase import Atoms, Atom
