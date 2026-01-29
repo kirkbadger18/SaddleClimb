@@ -1,5 +1,5 @@
 # SaddleClimb:
-## A path constrained mode following saddle point search algorithm
+## A path biased minimum mode following saddle point search algorithm
 
 This method combines the advantages of both single and double ended search methods for finding first order saddle points that connect
 reactive intermediates to one another. At the start of the optimization, the atoms corresponding to an initial state are slowly stepped uphill in the direction of the average path. The average path is the difference between the final state and the initial state. At each step, an approximate hessian is updated using the TS-BFGS method. Once one of the eigenvectors switches to being negative, the rest of the optimization is done via. minimum mode following. This seems to work over a wide range of surface reactions from dissociation, abstraction, vdW dissociation. It seems to take somewhere between 60-200 gradient calls from an electronic structure calulator to achieve convergence of 0.01 eV/Angstrom. In comparison a NEB with 7 intermediate images might need 7*300 = 2100 gradient calls. Please test this out and let me know if it also works for you all.
