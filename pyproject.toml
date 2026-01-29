@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = { "" = "saddleclimb" }
+py-modules = ["saddleclimb"]
+
+[project]
+name = "saddleclimb"
+version = "0.1.0"
+description = "A tiny single-file Python tool"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+    { name = "Kirk Badger", email = "kirk_badger@brown.edu" }
+]
+dependencies = [
+   "numpy>=1.21",
+   "ase",
+]
