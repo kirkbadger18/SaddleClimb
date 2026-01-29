@@ -2,71 +2,33 @@
 ## A path constrained mode following saddle point search algorithm
 
 This method combines the advantages of both single and double ended search methods for finding first order saddle points that connect
-reactive intermediates to one another. The atoms corresponding to an initial state are slowly stepped uphill along the mode which has the largest
-dot product with the reaction path. This path is not known exactly, but instead is fitted to the equation of an ellipse, where the verticies correspond to the initial and final states of the reaction. This method uses the final state coordinates to impose a path to guide the molecule uphill and towards the final state, but never constructs a string as other double ended methods to. This makes this method much faster, while retaining the robustness of a double
-ended method.
+reactive intermediates to one another. At the start of the optimization, the atoms corresponding to an initial state are slowly stepped uphill in the direction of the average path. The average path is the difference between the final state and the initial state. At each step, an approximate hessian is updated using the TS-BFGS method. Once one of the eigenvectors switches to being negative, the rest of the optimization is done via. minimum mode following. This seems to work over a wide range of surface reactions from dissociation, abstraction, vdW dissociation. It seems to take somewhere between 60-200 gradient calls from an electronic structure calulator to achieve convergence of 0.01 eV/Angstrom. In comparison a NEB with 7 intermediate images might need 7*300 = 2100 gradient calls. Please test this out and let me know if it also works for you all.
 
 ## Installation
 First clone this repository:
 
-` git clone git@github.com:kirkbadger18/SaddleClimb.git`
+`git clone git@github.com:kirkbadger18/SaddleClimb.git`
 
-Then add to your `~/.bashrc` file:
+Then activate your virtual environment of choice containing ASE, enter the repository directory, and build the package with:
 
-`export PATH=/path/to/saddleclimb/repo/saddleclimb.py:$PATH`
-
-Lastly restart your shell, or source your `~/.bashrc`
+`pip install ./`
 
 ## How to Use
-This tool is meant to be used in combination with the Atomic Simulation Environment (ASE), so make sure that is installed. First you will need to have 
-geometry files for the initial and final states of your reaction. Then you can use Saddleclimb to search for the first order saddle point connecting the two. As an example I have an initial state with *CH on Pt(111) and a final state where the *CH has dissociated to form *C and *H. I then used saddleclimb to find the first order saddle point connecting the two. Below is an example of how saddleclimb was used.
+This tool is meant to be used in combination with the Atomic Simulation Environment (ASE). It will take in ASE Atoms objects and ASE calculator objects. To instantiate a SaddleClimb object you will need an initial state (optimized), and a final state (also optimized), a calculator, and a list of the indicies of the atoms which will be moving throughout the reaction. The The initial and final states are ASE Atoms objects, the calculator is an ASE calculator object, and the list of indicies is just a python list of integers. The following section of code is an example of how this would be set up for the diffusion of a carbon adatom from one site to another using the EMT calculator.
 
 ```python
 from ase import Atoms, Atom
 from ase.io import read
 from saddleclimb import SaddleClimb
-from ase.calculators.espresso import Espresso, EspressoProfile
-from saddleclimb_test import SaddleClimb
 from ase.calculators.emt import EMT
 
-pwx = '/oscar/runtime/software/external/quantum-espresso/7.1-git/bin/pw.x'
-profile = EspressoProfile(
-    command='mpirun -n 96 --bind-to core {}'.format(pwx),
-    pseudo_dir='/users/kbadger1/espresso/pseudo/pslibrary.1.0.0/pbe/PSEUDOPOTENTIALS/',
-)
-
-input_data = dict(
-        input_dft='beef-vdw',
-        occupations='smearing',
-        smearing='marzari-vanderbilt',
-        degauss=0.02,
-        ecutwfc=40, #opt setting
-        ecutrho = 410,
-        nosym=True,
-        nspin=1,
-        mixing_mode='local-TF',
-        tprnfor=True,
-        )
-
-calc = Espresso(
-                pseudopotentials=dict(
-                                    Pt='Pt.pbe-n-kjpaw_psl.1.0.0.UPF',
-                                    C='C.pbe-n-kjpaw_psl.1.0.0.UPF',
-                                    O='O.pbe-nl-kjpaw_psl.1.0.0.UPF',
-                                    H='H.pbe-kjpaw_psl.1.0.0.UPF',
-                                    N='N.pbe-n-kjpaw_psl.1.0.0.UPF',),
-                input_data=input_data,
-                profile=profile,
-                kpts=(5, 5, 1), #opt setting
-
-                )
-
-init=read('../../minimizations/init/opt.traj')
-final=read('../../minimizations/final/opt.traj')
-idx = list(range(18,38))
+calc = EMT()
+init=read('../init/opt.traj')
+final=read('../final/opt.traj')
+idx = list(range(18,37))
 
 climber = SaddleClimb(init, final, calc, idx)
 climber.run()
 ```
 
-To see more details refer to this example and others in the [example](https://github.com/kirkbadger18/SaddleClimb/tree/main/examples/CH_to_C_H) folder
+To see more details of this example see [here](https://github.com/kirkbadger18/SaddleClimb/tree/main/examples/minimal_using_EMT)
