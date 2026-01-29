@@ -35,7 +35,7 @@ class SaddleClimb:
         self.logfile = logfile
         self.trajfile = trajfile
 
-    def _get_step(self, B, g, pos_1D):
+    def _get_step(self, B, g,pos_1D):
         dxi = self._pos_i_1D - pos_1D
         dxf = self._pos_f_1D - pos_1D
         dxi_to_f = self._pos_f_1D - self._pos_i_1D
