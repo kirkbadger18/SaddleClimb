@@ -30,5 +30,31 @@ idx = list(range(18,37))
 climber = SaddleClimb(init, final, calc, idx)
 climber.run()
 ```
-
 To see more details of this example see [here](https://github.com/kirkbadger18/SaddleClimb/tree/main/examples/minimal_using_EMT)
+## SaddleClimb output
+The output from Saddleclimb is two files: climb.log, and climb.traj. In climb.log, the iteration number, energy, and fmax values are stored after each gradient call to the ASE calculator supplied. For the above example this looks like:
+```
+Iteration           Energy (eV)         Fmax (eV/A)         
+0                   7.162017            0.000888            
+1                   7.162922            0.030578            
+2                   7.16546             0.05738             
+3                   7.175275            0.157905            
+4                   7.205316            0.469773            
+5                   7.23593             0.751324            
+6                   7.239443            0.729584            
+7                   7.232197            0.624944            
+8                   7.216657            0.178321            
+9                   7.21549             0.0771              
+10                  7.214951            0.08292             
+11                  7.213808            0.047538            
+12                  7.213432            0.037712            
+13                  7.213204            0.043334            
+14                  7.212673            0.049304            
+15                  7.211994            0.037834            
+16                  7.211815            0.027823            
+17                  7.211764            0.026378            
+18                  7.211704            0.018304            
+19                  7.211657            0.009406
+```
+And climb.traj can be opened with `ase gui` and shows the geometry and energy of each step. The energy profiles typically look like:
+<img width="1.5*294" height="1.5*191" alt="image" src="https://github.com/user-attachments/assets/57b35f13-9522-4236-b008-6b5060f946ed" />
