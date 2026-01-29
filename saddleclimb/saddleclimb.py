@@ -40,7 +40,6 @@ class SaddleClimb:
         dxf = self._pos_f_1D - pos_1D
         dxi_to_f = self._pos_f_1D - self._pos_i_1D
         eigs_B, vecs_B = LA.eigh(B)
-        print('eigs0', eigs_B[0])
         self._climbing = True
         if np.dot(g, dxi) < 0 and np.dot(g, dxf) < 0:
             eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
@@ -147,8 +146,7 @@ class SaddleClimb:
         n_str = 'Iteration'.ljust(20)
         E_str = 'Energy (eV)'.ljust(20)
         F_str = 'Fmax (eV/A)'.ljust(20)
-        climb = 'Climbing Direction'
-        log_string = n_str + E_str + F_str + climb
+        log_string = n_str + E_str + F_str
         climb = Path(self.logfile)
         if climb.exists():
             os.remove(self.logfile)
