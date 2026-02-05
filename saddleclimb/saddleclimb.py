@@ -135,11 +135,8 @@ class SaddleClimb:
         return log_string
 
     def _log(self: None, string: str) -> None:
-        if self.logfile is None:
-            print(string)
-        else:
-            with open(self.logfile, 'a') as log:
-                log.write(string + '\n')
+        with open(self.logfile, 'a') as log:
+            log.write(string + '\n')
         sys.stdout.flush()
 
     def _initialize_logging(self: None):
