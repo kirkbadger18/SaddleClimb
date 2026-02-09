@@ -16,7 +16,7 @@ class SaddleClimb:
             atoms_initial: Atoms,
             atoms_final: Atoms,
             calculator: Calculator,
-            indices: list,
+            indices: list = None,
             fmax: float = 0.01,
             maxstepsize: float = 0.2,
             delta0: float = 0.05,
@@ -27,13 +27,23 @@ class SaddleClimb:
         self.atoms_initial = atoms_initial
         self.atoms_final = atoms_final
         self.indices = indices
-        self.hessian = 100 * np.eye(3*len(self.indices))
         self.calculator = calculator
         self.fmax = fmax
         self.maxstepsize = maxstepsize
         self.delta = delta0
         self.logfile = logfile
         self.trajfile = trajfile
+        if not self.indices:
+            self._get_moving_atoms()
+        self.hessian = 100 * np.eye(3*len(self.indices))
+
+    def _get_moving_atoms(self):
+        dpos = self.atoms_final.positions - self.atoms_initial.positions
+        idx = []
+        for i in range(dpos.shape[0]):
+            if LA.norm(dpos[i, :]) > 1e-6:
+                idx.append(i)
+        self.indices = idx.copy()
 
     def _get_step(self, B, g, pos_1D):
         dxi = self._pos_i_1D - pos_1D

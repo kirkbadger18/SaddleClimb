@@ -39,9 +39,5 @@ calc = Espresso(
 init=read('../init/opt.traj')
 final=read('../final/opt.traj')
 
-no_slab=18
-total=init.get_global_number_of_atoms()
-idx=list(np.arange(no_slab,total,1))
-
-climber = SaddleClimb(init, final, calc, idx)
+climber = SaddleClimb(init, final, calc)
 climber.run()
