@@ -7,6 +7,7 @@ from ase.atoms import Atoms
 from ase.calculators.calculator import Calculator
 from ase.io.trajectory import Trajectory
 from pathlib import Path
+import copy
 
 
 class SaddleClimb:
@@ -112,9 +113,9 @@ class SaddleClimb:
         atoms = self.atoms_initial.copy()
         constraints = self.atoms_initial.constraints.copy()
         atoms.set_constraint(constraints)
-        atoms.calc = self.calculator
-        idx = self.indices
-        B_init = self.hessian
+        atoms.calc = copy.deepcopy(self.calculator)
+        idx = self.indices.copy()
+        B_init = self.hessian.copy()
         return atoms, idx, B_init
 
     def _initialize_run(self: None, atoms: Atoms, idx: list) -> np.ndarray:

@@ -1,5 +1,6 @@
 import numpy as np
 import numpy.linalg as LA
+from numpy.testing import assert_allclose
 import pytest
 from ase import Atoms
 from ase.calculators.calculator import Calculator
@@ -126,4 +127,17 @@ def test_get_F():
     F = climber._get_F(test_atoms)
     assert isinstance(F, np.ndarray)
     assert F.shape == atoms.positions.shape
-    assert test_atoms.positions.all() == atoms.positions.all()
+    assert_allclose(test_atoms.positions, atoms.positions)
+
+
+def test_initialize_atoms():
+    climber = generate_saddleclimb_object()
+    atoms = climber.atoms_initial.copy()
+    atoms_test, idx_test, B_test = climber._initialize_atoms()
+    assert isinstance(atoms_test, Atoms)
+    assert isinstance(idx_test, list)
+    assert isinstance(B_test, np.ndarray)
+    assert atoms == atoms_test
+    assert climber.calculator.results == atoms_test.calc.results
+    assert climber.indices == idx_test
+    assert_allclose(climber.hessian, B_test)
