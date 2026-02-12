@@ -34,6 +34,7 @@ class SaddleClimb:
         self.delta = delta0
         self.logfile = logfile
         self.trajfile = trajfile
+        self._restart = False
         if not self.indices:
             self._get_moving_atoms()
         self.hessian = 100 * np.eye(3*len(self.indices))
@@ -118,7 +119,18 @@ class SaddleClimb:
         B_init = self.hessian.copy()
         return atoms, idx, B_init
 
-    def _initialize_run(self: None, atoms: Atoms, idx: list) -> np.ndarray:
+    def _initialize_atoms_restart(self: None) -> tuple[Atoms,
+                                                       np.ndarray,
+                                                       np.ndarray]:
+        atoms = self._restart_trajectory.copy()
+        constraints = self._restart_trajectory.constraints.copy()
+        atoms.set_constraint(constraints)
+        atoms.calc = copy.deepcopy(self.calculator)
+        idx = self.indices.copy()
+        B_init = self._restart_trajectory.info['saddleclimb_hessian'].copy()
+        return atoms, idx, B_init
+
+    def _initialize_run(self: None, atoms: Atoms, idx: list):
         traj = Trajectory(self.trajfile, 'w')
         g_init = -self._get_F(atoms)[idx, :].reshape(-1)
         E_init = atoms.calc.results['energy']
@@ -128,15 +140,22 @@ class SaddleClimb:
         self._log(log_string)
         return traj, g_init, E_init
 
+    def _initialize_run_restart(self: None, idx: list):
+        traj = Trajectory(self.trajfile, 'a')
+        g_tot = -self._restart_trajectory.calc.results['forces']
+        g = g_tot[idx, :].reshape(-1).copy()
+        E = self._restart_trajectory.calc.results['energy'] + 0
+        Fmax = np.max(np.abs(g))
+        return traj, g, E, Fmax
+
     def _get_initial_step(
             self: None, idx: list
             ) -> tuple[np.ndarray, np.ndarray]:
-
         self._pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
         self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
         dx_1D = self.delta * self.normalize(self._pos_f_1D - self._pos_i_1D)
-        dx_init = dx_1D.reshape(-1, 3)
-        return dx_init
+        dx = dx_1D.reshape(-1, 3)
+        return dx, dx_1D
 
     def _get_log_string(self, n, E, Fmax):
         n_str = str(n).ljust(20)
@@ -154,9 +173,12 @@ class SaddleClimb:
         n_str = 'Iteration'.ljust(20)
         E_str = 'Energy (eV)'.ljust(20)
         F_str = 'Fmax (eV/A)'.ljust(20)
-        log_string = n_str + E_str + F_str
+        if self._restart:
+            log_string = '\nRestarting:\n' + n_str + E_str + F_str
+        else:
+            log_string = n_str + E_str + F_str
         climb = Path(self.logfile)
-        if climb.exists():
+        if climb.exists() and not self._restart:
             os.remove(self.logfile)
         self._log(log_string)
 
@@ -168,13 +190,23 @@ class SaddleClimb:
             raise Exception('forces not able to be computed')
         return f
 
-    def run(self: None) -> None:
-        atoms, idx, B = self._initialize_atoms()
+    def climb(self: None, maxsteps=None) -> None:
         self._initialize_logging()
-        traj, g, E = self._initialize_run(atoms, idx)
-        dx = self._get_initial_step(idx)
-        dx_1D = dx.reshape(-1)
-        Fmax, dxi, n = 1, 0, 0
+        if self._restart:
+            atoms, idx, B = self._initialize_atoms_restart()
+            traj, g, E, Fmax = self._initialize_run_restart(idx)
+            self._pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
+            self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
+            dx_1D = self._get_step(B, g, atoms.positions[idx, :].reshape(-1))
+            dx = dx_1D.reshape(-1, 3)
+            pos_1D = atoms.positions[idx, :].reshape(-1)
+            dxi = LA.norm(self._pos_i_1D - pos_1D)
+            n = self._restart_trajectory.info['saddleclimb_iterations']
+        else:
+            atoms, idx, B = self._initialize_atoms()
+            traj, g, E = self._initialize_run(atoms, idx)
+            dx, dx_1D = self._get_initial_step(idx)
+            Fmax, dxi, n = 1, 0, 0
         while Fmax > self.fmax or dxi < 0.5:
             atoms.positions[idx, :] += dx
             pos_1D = atoms.positions[idx, :].reshape(-1)
@@ -190,7 +222,20 @@ class SaddleClimb:
             n += 1
             log_string = self._get_log_string(n, E, Fmax)
             self._log(log_string)
+            atoms.info['saddleclimb_hessian'] = B.copy()
+            atoms.info['saddleclimb_iterations'] = n + 0
             traj.write(atoms)
+            if maxsteps and n >= maxsteps:
+                self._log('maxsteps reached, terminating!')
+                break
+            if Fmax < self.fmax and dxi > 0.5:
+                self._log('Optimization complete!')
+
+    def restart_climb(self, restart_trajectory: Atoms):
+        assert 'saddleclimb_hessian' in restart_trajectory.info
+        self._restart = True
+        self._restart_trajectory = copy.deepcopy(restart_trajectory)
+        self.climb()
 
     def normalize(self: None, v: np.ndarray) -> np.ndarray:
         norm = LA.norm(v)

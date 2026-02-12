@@ -40,4 +40,4 @@ init=read('../init/opt.traj')
 final=read('../final/opt.traj')
 
 climber = SaddleClimb(init, final, calc)
-climber.run()
+climber.climb()
