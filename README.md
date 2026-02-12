@@ -27,9 +27,24 @@ init=read('../init/opt.traj')
 final=read('../final/opt.traj')
 
 climber = SaddleClimb(init, final, calc)
-climber.run()
+climber.climb()
 ```
-To see more details of this example see [here](https://github.com/kirkbadger18/SaddleClimb/tree/main/examples/minimal_using_EMT)
+To see more details of this example see: [here](https://github.com/kirkbadger18/SaddleClimb/tree/main/examples/minimal_using_EMT)
+If the job gets canceled or fails for some reason, the calculation can be restarted using the `restart_climb()` method. This would look like:
+```python
+from ase import Atoms, Atom
+from ase.io import read
+from saddleclimb import SaddleClimb
+from ase.calculators.emt import EMT
+
+calc = EMT()
+init=read('../../init/opt.traj')
+final=read('../../final/opt.traj')
+restarttraj = read('climb.traj')
+climber = SaddleClimb(init, final, calc)
+climber.restart_climb(restarttraj)
+```
+To see more details of restarting a job see: [here](https://github.com/kirkbadger18/SaddleClimb/tree/main/examples/minimal_using_EMT/saddleclimb/with_restart)
 ## SaddleClimb output
 The output from Saddleclimb is two files: climb.log, and climb.traj. In climb.log, the iteration number, energy, and fmax values are stored after each gradient call to the ASE calculator supplied. For the above example this looks like:
 ```
