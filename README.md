@@ -29,7 +29,8 @@ final=read('../final/opt.traj')
 climber = SaddleClimb(init, final, calc)
 climber.climb()
 ```
-To see more details of this example see: [here](https://github.com/kirkbadger18/SaddleClimb/tree/main/examples/minimal_using_EMT)
+To see more details of this example see: [here](https://github.com/kirkbadger18/SaddleClimb/tree/main/examples/minimal_using_EMT).
+
 If the job gets canceled or fails for some reason, the calculation can be restarted using the `restart_climb()` method. This would look like:
 ```python
 from ase import Atoms, Atom
