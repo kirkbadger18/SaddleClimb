@@ -128,8 +128,6 @@ class SaddleClimb:
         atoms.calc = copy.deepcopy(self.calculator)
         idx = self.indices.copy()
         B_init = np.array(atoms.info["saddleclimb_hessian"])
-        #B_init = B_init.reshape(atoms.info["saddleclimb_hessian_shape"])
-        #B_init = self._restart_trajectory.info['saddleclimb_hessian'].copy()
         return atoms, idx, B_init
 
     def _initialize_run(self: None, atoms: Atoms, idx: list):
@@ -226,14 +224,10 @@ class SaddleClimb:
             self._log(log_string)
             atoms.info["saddleclimb_hessian"] = B.tolist()
             atoms.info["saddleclimb_hessian_shape"] = B.shape
-            #atoms.info['saddleclimb_hessian'] = B.copy()
             atoms.info['saddleclimb_iterations'] = n + 0
             traj.write(atoms)
             if maxsteps and n >= maxsteps:
-            #    self._log('maxsteps reached, terminating!')
                 break
-            #if Fmax < self.fmax and dxi > 0.5:
-            #    self._log('Optimization complete!')
 
     def restart_climb(self, restart_trajectory: Atoms):
         assert 'saddleclimb_hessian' in restart_trajectory.info
