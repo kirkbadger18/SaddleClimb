@@ -127,7 +127,9 @@ class SaddleClimb:
         atoms.set_constraint(constraints)
         atoms.calc = copy.deepcopy(self.calculator)
         idx = self.indices.copy()
-        B_init = self._restart_trajectory.info['saddleclimb_hessian'].copy()
+        B_init = np.array(atoms.info["saddleclimb_hessian"])
+        #B_init = B_init.reshape(atoms.info["saddleclimb_hessian_shape"])
+        #B_init = self._restart_trajectory.info['saddleclimb_hessian'].copy()
         return atoms, idx, B_init
 
     def _initialize_run(self: None, atoms: Atoms, idx: list):
@@ -174,7 +176,7 @@ class SaddleClimb:
         E_str = 'Energy (eV)'.ljust(20)
         F_str = 'Fmax (eV/A)'.ljust(20)
         if self._restart:
-            log_string = '\nRestarting:\n' + n_str + E_str + F_str
+            log_string = 'Restarting:\n' + n_str + E_str + F_str
         else:
             log_string = n_str + E_str + F_str
         climb = Path(self.logfile)
@@ -222,14 +224,16 @@ class SaddleClimb:
             n += 1
             log_string = self._get_log_string(n, E, Fmax)
             self._log(log_string)
-            atoms.info['saddleclimb_hessian'] = B.copy()
+            atoms.info["saddleclimb_hessian"] = B.tolist()
+            atoms.info["saddleclimb_hessian_shape"] = B.shape
+            #atoms.info['saddleclimb_hessian'] = B.copy()
             atoms.info['saddleclimb_iterations'] = n + 0
             traj.write(atoms)
             if maxsteps and n >= maxsteps:
-                self._log('maxsteps reached, terminating!')
+            #    self._log('maxsteps reached, terminating!')
                 break
-            if Fmax < self.fmax and dxi > 0.5:
-                self._log('Optimization complete!')
+            #if Fmax < self.fmax and dxi > 0.5:
+            #    self._log('Optimization complete!')
 
     def restart_climb(self, restart_trajectory: Atoms):
         assert 'saddleclimb_hessian' in restart_trajectory.info
