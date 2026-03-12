@@ -145,7 +145,7 @@ class SaddleClimb:
         g_tot = -self._restart_trajectory.calc.results['forces']
         g = g_tot[idx, :].reshape(-1).copy()
         E = self._restart_trajectory.calc.results['energy'] + 0
-        Fmax = np.max(np.abs(g))
+        Fmax = LA.norm(-g.reshape(-1, 3), axis=1).max()
         return traj, g, E, Fmax
 
     def _get_initial_step(
@@ -215,7 +215,7 @@ class SaddleClimb:
             g = -self._get_F(atoms)[idx, :].reshape(-1)
             E = atoms.calc.results['energy']
             dg = g - g0
-            Fmax = np.max(np.abs(g))
+            Fmax = LA.norm(-g.reshape(-1, 3), axis=1).max()
             B = self._update_hessian(B, dg, dx_1D)
             dx_1D = self._get_step(B, g, pos_1D)
             dx = dx_1D.reshape(-1, 3)
