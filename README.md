@@ -46,6 +46,23 @@ climber = SaddleClimb(init, final, calc)
 climber.restart_climb(restarttraj)
 ```
 To see more details of restarting a job see: [here](https://github.com/kirkbadger18/SaddleClimb/tree/main/examples/minimal_using_EMT/saddleclimb/with_restart)
+
+If there are multiple coadsorbates that are perhapse moving throughout the reaction, SaddleClimb will include their movement in the average path. You can ask SaddleClimb to target specific reactive atom indices using the `target_indices` argument. This is a list of atom indices for which SaddleClimb should be using to assess the initial to final state direction. The code for this would look like:
+```
+from ase import Atoms, Atom
+from ase.io import read
+from saddleclimb import SaddleClimb
+from ase.calculators.emt import EMT
+
+calc = EMT()
+init=read('../init/opt.traj')
+final=read('../final/opt.traj')
+
+climber = SaddleClimb(init, final, calc, target_indices=[36])
+climber.climb()
+```
+To see an exampple of this look [here](https://github.com/kirkbadger18/SaddleClimb/blob/main/examples/EMT_with_coadsorbates/saddleclimb/run_climb.py). In this example we want to find the first order saddle point for the diffusion of C on a Pt(111) surface, but ther are other co-adsorbed carbon atoms, and one of the spectator carbon atoms is also moving from the initial to the final state.
+
 ## SaddleClimb output
 The output from Saddleclimb is two files: climb.log, and climb.traj. In climb.log, the iteration number, energy, and fmax values are stored after each gradient call to the ASE calculator supplied. For the above example this looks like:
 ```
