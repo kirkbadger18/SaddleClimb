@@ -17,7 +17,7 @@ class SaddleClimb:
             atoms_initial: Atoms,
             atoms_final: Atoms,
             calculator: Calculator,
-            indices: list = None,
+            target_indices: list = None,
             fmax: float = 0.01,
             maxstepsize: float = 0.2,
             delta0: float = 0.05,
@@ -27,7 +27,7 @@ class SaddleClimb:
 
         self.atoms_initial = atoms_initial
         self.atoms_final = atoms_final
-        self.indices = indices
+        self.target_indices = target_indices
         self.calculator = calculator
         self.fmax = fmax
         self.maxstepsize = maxstepsize
@@ -35,8 +35,9 @@ class SaddleClimb:
         self.logfile = logfile
         self.trajfile = trajfile
         self._restart = False
-        if not self.indices:
-            self._get_moving_atoms()
+        self._get_moving_atoms()
+        if self.target_indices:
+            self._get_sub_taret_atoms()
         self.hessian = 100 * np.eye(3*len(self.indices))
 
     def _get_moving_atoms(self):
@@ -46,6 +47,13 @@ class SaddleClimb:
             if LA.norm(dpos[i, :]) > 1e-6:
                 idx.append(i)
         self.indices = idx.copy()
+
+    def _get_sub_taret_atoms(self):
+        sub_indices = []
+        for i in range(len(self.indices)):
+            if self.indices[i] in self.target_indices:
+                sub_indices.append(i)
+        self.sub_target_indices = sub_indices.copy()
 
     def _get_step(self, B, g, pos_1D):
         dxi = self._pos_i_1D - pos_1D
@@ -59,10 +67,17 @@ class SaddleClimb:
         elif eigs_B[0] < 0:
             eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
         else:
-            vecs_tmp, R = LA.qr(dxi_to_f.reshape(len(dxi_to_f), 1),
-                                mode='complete')
-            B_transformed = mult(vecs_tmp.T, mult(B, vecs_tmp))
-            eigs_tmp = np.diag(B_transformed).copy()
+            first_column = dxi_to_f.copy()
+            if self.target_indices:
+                for i in range(len(self.indices)):
+                    if i not in self.sub_target_indices:
+                        first_column[3*i:3*i+3] = 0
+            new_basis, R = LA.qr(first_column.reshape(len(dxi_to_f), 1),
+                                 mode='complete')
+            B_transformed = mult(new_basis.T, mult(B, new_basis))
+            B_transformed[1:, 0], B_transformed[0, 1:] = 0, 0
+            B_new = mult(new_basis, mult(B_transformed, new_basis.T))
+            eigs_tmp, vecs_tmp = LA.eigh(B_new)
         for i, eig in enumerate(eigs_tmp):
             if i == 0 and self._climbing:
                 eigs_tmp[i] = - np.abs(eig)
@@ -154,6 +169,10 @@ class SaddleClimb:
         self._pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
         self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
         dx_1D = self.delta * self.normalize(self._pos_f_1D - self._pos_i_1D)
+        if self.target_indices:
+            for i in range(len(self.indices)):
+                if i not in self.sub_target_indices:
+                    dx_1D[3*i:3*i+3] = 0
         dx = dx_1D.reshape(-1, 3)
         return dx, dx_1D
 
