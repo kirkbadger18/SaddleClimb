@@ -61,7 +61,7 @@ final=read('../final/opt.traj')
 climber = SaddleClimb(init, final, calc, target_indices=[36])
 climber.climb()
 ```
-To see an exampple of this look [here](https://github.com/kirkbadger18/SaddleClimb/blob/main/examples/EMT_with_coadsorbates/saddleclimb/run_climb.py). In this example we want to find the first order saddle point for the diffusion of C on a Pt(111) surface, but ther are other co-adsorbed carbon atoms, and one of the spectator carbon atoms is also moving from the initial to the final state.
+To see an exampple of this look [here](https://github.com/kirkbadger18/SaddleClimb/blob/main/examples/EMT_with_coadsorbates). In this example we want to find the first order saddle point for the diffusion of C on a Pt(111) surface, but ther are other co-adsorbed carbon atoms, and one of the spectator carbon atoms is also moving from the initial to the final state.
 
 ## SaddleClimb output
 The output from Saddleclimb is two files: climb.log, and climb.traj. In climb.log, the iteration number, energy, and fmax values are stored after each gradient call to the ASE calculator supplied. For the above example this looks like:
