@@ -48,7 +48,7 @@ climber.restart_climb(restarttraj)
 To see more details of restarting a job see: [here](https://github.com/kirkbadger18/SaddleClimb/tree/main/examples/minimal_using_EMT/saddleclimb/with_restart)
 
 If there are multiple coadsorbates that are perhapse moving throughout the reaction, SaddleClimb will include their movement in the average path. You can ask SaddleClimb to target specific reactive atom indices using the `target_indices` argument. This is a list of atom indices for which SaddleClimb should be using to assess the initial to final state direction. The code for this would look like:
-```
+```python
 from ase import Atoms, Atom
 from ase.io import read
 from saddleclimb import SaddleClimb
