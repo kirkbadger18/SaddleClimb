@@ -1,11 +1,9 @@
-import numpy as np
 import numpy.linalg as LA
 from numpy.testing import assert_allclose
 import pytest
 from ase.build import fcc111, add_adsorbate
 from ase.calculators.emt import EMT
 from ase.constraints import FixAtoms
-from ase.io.trajectory import Trajectory
 from ase.optimize import BFGS
 from ase.optimize.optimize import Optimizer
 
@@ -80,8 +78,7 @@ class TestInit:
     def test_moving_indices_type(self, sc):
         assert isinstance(sc.moving_indices, list)
 
-    def test_moving_indices_only_displaced_atoms(self, relaxed_pair,
-      tmp_path):
+    def test_moving_indices_only_displaced_atoms(self, relaxed_pair, tmp_path):
         atoms_i, atoms_f = relaxed_pair
         atoms = atoms_i.copy()
         atoms.calc = EMT()
