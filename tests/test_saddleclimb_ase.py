@@ -1,128 +1,128 @@
-# import numpy as np
-# import numpy.linalg as LA
-# from numpy.testing import assert_allclose
-# import pytest
-# from ase.build import fcc111, add_adsorbate
-# from ase.calculators.emt import EMT
-# from ase.constraints import FixAtoms
-# from ase.io.trajectory import Trajectory
-# from ase.optimize import BFGS
-# from ase.optimize.optimize import Optimizer
+import numpy as np
+import numpy.linalg as LA
+from numpy.testing import assert_allclose
+import pytest
+from ase.build import fcc111, add_adsorbate
+from ase.calculators.emt import EMT
+from ase.constraints import FixAtoms
+from ase.io.trajectory import Trajectory
+from ase.optimize import BFGS
+from ase.optimize.optimize import Optimizer
 
-# from saddleclimb_ase import SaddleClimb
-
-
-# # ---------------------------------------------------------------------------
-# # Fixtures
-# # ---------------------------------------------------------------------------
-
-# @pytest.fixture(scope='module')
-# def relaxed_pair():
-#     """Relaxed initial and final states for a H hop on Pt(111).
-
-#     Module-scoped so the two BFGS relaxations run only once per test session.
-#     Tests must call .copy() before modifying either object.
-#     """
-#     slab = fcc111('Pt', size=(2, 2, 3), vacuum=10.0)
-#     add_adsorbate(slab, 'H', 1.5, 'fcc')
-#     slab.set_constraint(FixAtoms(mask=[a.tag > 1 for a in slab]))
-
-#     atoms_i = slab.copy()
-#     atoms_i.calc = EMT()
-#     BFGS(atoms_i, logfile=None).run(fmax=0.01)
-
-#     atoms_f = atoms_i.copy()
-#     atoms_f.positions[-1, 0] += 1.5
-#     atoms_f.calc = EMT()
-#     BFGS(atoms_f, logfile=None).run(fmax=0.01)
-
-#     return atoms_i, atoms_f
+from saddleclimb_ase import SaddleClimb
 
 
-# @pytest.fixture
-# def sc(relaxed_pair, tmp_path):
-#     """Fresh SaddleClimb instance with EMT calculator and tmp file paths."""
-#     atoms_i, atoms_f = relaxed_pair
-#     atoms = atoms_i.copy()
-#     atoms.calc = EMT()
-#     return SaddleClimb(
-#         atoms, atoms_f,
-#         logfile=str(tmp_path / 'climb.log'),
-#         trajectory=None,
-#     )
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope='module')
+def relaxed_pair():
+    """Relaxed initial and final states for a H hop on Pt(111).
+
+    Module-scoped so the two BFGS relaxations run only once per test session.
+    Tests must call .copy() before modifying either object.
+    """
+    slab = fcc111('Pt', size=(2, 2, 3), vacuum=10.0)
+    add_adsorbate(slab, 'H', 1.5, 'fcc')
+    slab.set_constraint(FixAtoms(mask=[a.tag > 1 for a in slab]))
+
+    atoms_i = slab.copy()
+    atoms_i.calc = EMT()
+    BFGS(atoms_i, logfile=None).run(fmax=0.01)
+
+    atoms_f = atoms_i.copy()
+    atoms_f.positions[-1, 0] += 1.5
+    atoms_f.calc = EMT()
+    BFGS(atoms_f, logfile=None).run(fmax=0.01)
+
+    return atoms_i, atoms_f
 
 
-# @pytest.fixture
-# def sc_with_traj(relaxed_pair, tmp_path):
-#     """SaddleClimb instance that writes a trajectory for restart tests."""
-#     atoms_i, atoms_f = relaxed_pair
-#     atoms = atoms_i.copy()
-#     atoms.calc = EMT()
-#     return SaddleClimb(
-#         atoms, atoms_f,
-#         logfile=str(tmp_path / 'climb.log'),
-#         trajectory=str(tmp_path / 'climb.traj'),
-#     )
+@pytest.fixture
+def sc(relaxed_pair, tmp_path):
+    """Fresh SaddleClimb instance with EMT calculator and tmp file paths."""
+    atoms_i, atoms_f = relaxed_pair
+    atoms = atoms_i.copy()
+    atoms.calc = EMT()
+    return SaddleClimb(
+        atoms, atoms_f,
+        logfile=str(tmp_path / 'climb.log'),
+        trajectory=None,
+    )
 
 
-# # ---------------------------------------------------------------------------
-# # __init__ / construction
-# # ---------------------------------------------------------------------------
+@pytest.fixture
+def sc_with_traj(relaxed_pair, tmp_path):
+    """SaddleClimb instance that writes a trajectory for restart tests."""
+    atoms_i, atoms_f = relaxed_pair
+    atoms = atoms_i.copy()
+    atoms.calc = EMT()
+    return SaddleClimb(
+        atoms, atoms_f,
+        logfile=str(tmp_path / 'climb.log'),
+        trajectory=str(tmp_path / 'climb.traj'),
+    )
 
-# class TestInit:
 
-#     def test_is_ase_optimizer(self, sc):
-#         assert isinstance(sc, Optimizer)
+# ---------------------------------------------------------------------------
+# __init__ / construction
+# ---------------------------------------------------------------------------
 
-#     def test_moving_indices_nonempty(self, sc):
-#         assert len(sc.moving_indices) > 0
+class TestInit:
 
-#     def test_moving_indices_type(self, sc):
-#         assert isinstance(sc.moving_indices, list)
+    def test_is_ase_optimizer(self, sc):
+        assert isinstance(sc, Optimizer)
 
-#     def test_moving_indices_only_displaced_atoms(self, relaxed_pair,
-#       tmp_path):
-#         atoms_i, atoms_f = relaxed_pair
-#         atoms = atoms_i.copy()
-#         atoms.calc = EMT()
-#         sc = SaddleClimb(
-#             atoms, atoms_f,
-#             logfile=str(tmp_path / 'climb.log'),
-#             trajectory=None,
-#         )
-#         dpos = atoms_f.positions - atoms_i.positions
-#         expected = [i for i in range(len(atoms_i))
-#                     if LA.norm(dpos[i]) > 1e-6]
-#         assert sc.moving_indices == expected
+    def test_moving_indices_nonempty(self, sc):
+        assert len(sc.moving_indices) > 0
 
-#     def test_pos_initial_shape(self, sc):
-#         expected_len = 3 * len(sc.moving_indices)
-#         assert sc._pos_initial.shape == (expected_len,)
+    def test_moving_indices_type(self, sc):
+        assert isinstance(sc.moving_indices, list)
 
-#     def test_pos_final_shape(self, sc):
-#         expected_len = 3 * len(sc.moving_indices)
-#         assert sc._pos_final.shape == (expected_len,)
+    def test_moving_indices_only_displaced_atoms(self, relaxed_pair,
+      tmp_path):
+        atoms_i, atoms_f = relaxed_pair
+        atoms = atoms_i.copy()
+        atoms.calc = EMT()
+        sc = SaddleClimb(
+            atoms, atoms_f,
+            logfile=str(tmp_path / 'climb.log'),
+            trajectory=None,
+        )
+        dpos = atoms_f.positions - atoms_i.positions
+        expected = [i for i in range(len(atoms_i))
+                    if LA.norm(dpos[i]) > 1e-6]
+        assert sc.moving_indices == expected
 
-#     def test_pos_initial_captured_at_construction(
-#         self, relaxed_pair, tmp_path
-#     ):
-#         """_pos_initial must snapshot the geometry passed in."""
-#         atoms_i, atoms_f = relaxed_pair
-#         atoms = atoms_i.copy()
-#         atoms.calc = EMT()
-#         original_pos = atoms.positions.copy()
-#         sc = SaddleClimb(
-#             atoms, atoms_f,
-#             logfile=str(tmp_path / 'climb.log'),
-#             trajectory=None,
-#         )
-#         # Mutate atoms after construction
-#         atoms.positions += 5.0
-#         idx = sc.moving_indices
-#         assert_allclose(
-#             sc._pos_initial,
-#             original_pos[idx].ravel(),
-#         )
+    def test_pos_initial_shape(self, sc):
+        expected_len = 3 * len(sc.moving_indices)
+        assert sc._pos_initial.shape == (expected_len,)
+
+    def test_pos_final_shape(self, sc):
+        expected_len = 3 * len(sc.moving_indices)
+        assert sc._pos_final.shape == (expected_len,)
+
+    def test_pos_initial_captured_at_construction(
+        self, relaxed_pair, tmp_path
+    ):
+        """_pos_initial must snapshot the geometry passed in."""
+        atoms_i, atoms_f = relaxed_pair
+        atoms = atoms_i.copy()
+        atoms.calc = EMT()
+        original_pos = atoms.positions.copy()
+        sc = SaddleClimb(
+            atoms, atoms_f,
+            logfile=str(tmp_path / 'climb.log'),
+            trajectory=None,
+        )
+        # Mutate atoms after construction
+        atoms.positions += 5.0
+        idx = sc.moving_indices
+        assert_allclose(
+            sc._pos_initial,
+            original_pos[idx].ravel(),
+        )
 
 #     def test_hessian_is_scaled_identity(self, sc):
 #         n = 3 * len(sc.moving_indices)
