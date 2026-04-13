@@ -80,7 +80,8 @@
 #     def test_moving_indices_type(self, sc):
 #         assert isinstance(sc.moving_indices, list)
 
-#     def test_moving_indices_only_displaced_atoms(self, relaxed_pair, tmp_path):
+#     def test_moving_indices_only_displaced_atoms(self, relaxed_pair,
+#       tmp_path):
 #         atoms_i, atoms_f = relaxed_pair
 #         atoms = atoms_i.copy()
 #         atoms.calc = EMT()
@@ -226,7 +227,8 @@
 
 # class TestRestartValidation:
 
-#     def test_missing_file_raises_file_not_found(self, relaxed_pair, tmp_path):
+#     def test_missing_file_raises_file_not_found(self, relaxed_pair,
+# tmp_path):
 #         atoms_i, atoms_f = relaxed_pair
 #         atoms = atoms_i.copy()
 #         atoms.calc = EMT()
@@ -405,7 +407,8 @@
 
 #     def test_magnitude_equals_delta(self, sc):
 #         step = sc._get_initial_step()
-#         # Magnitude per-atom norm should sum to delta in the normalised sense;
+#         # Magnitude per-atom norm should sum to delta in the
+# normalised sense;
 #         # overall vector norm equals delta.
 #         assert LA.norm(step) == pytest.approx(sc.delta)
 
