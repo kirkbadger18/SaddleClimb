@@ -9,9 +9,23 @@ First clone this repository:
 
 `git clone git@github.com:kirkbadger18/SaddleClimb.git`
 
-Then activate your virtual environment of choice containing ASE, enter the repository directory, and build the package with:
+Then activate your virtual environment of choice:
+
+`conda activate envname` (if using Conda)
+
+Then enter the directory:
+
+`cd SaddleClimb`
+
+ And install the package with:
 
 `pip install ./`
+
+Or if you want to modify code in your local repository have it be tracked by the installed package:
+
+`pip install -e ./`
+
+Now you are set to simply import this package from any directory with this conda environment active. Follow the steps below on how to use this package.
 
 ## How to Use
 This tool is meant to be used in combination with the Atomic Simulation Environment (ASE). It will take in ASE Atoms objects and ASE calculator objects. To instantiate a SaddleClimb object you will need an initial state (optimized), and a final state (also optimized), and a calculator. The initial and final states are ASE Atoms objects, and the calculator is an ASE calculator object. The following section of code is an example of how this would be set up for the diffusion of a carbon adatom from one site to another using the EMT calculator.
@@ -62,61 +76,6 @@ climber = SaddleClimb(init, final, calc, target_indices=[36])
 climber.climb()
 ```
 To see an exampple of this look [here](https://github.com/kirkbadger18/SaddleClimb/blob/main/examples/EMT_with_coadsorbates). In this example we want to find the first order saddle point for the diffusion of C on a Pt(111) surface, but ther are other co-adsorbed carbon atoms, and one of the spectator carbon atoms is also moving from the initial to the final state.
-
-## ASE Optimizer Interface
-
-SaddleClimb is also available as a native ASE `Optimizer` subclass in `saddleclimb_ase`. This interface integrates directly with ASE's optimizer conventions: attach the calculator to `atoms_initial`, then call `run(fmax=...)`. The trajectory and log are written automatically.
-
-```python
-from ase.io import read
-from ase.calculators.emt import EMT
-from saddleclimb_ase import SaddleClimb
-
-atoms_initial = read('../init/opt.traj')
-atoms_initial.calc = EMT()
-atoms_final = read('../final/opt.traj')
-
-climber = SaddleClimb(atoms_initial, atoms_final)
-climber.run(fmax=0.01)
-```
-
-To restart from a previous run, pass the trajectory written by the first run as `restart` and set `append_trajectory=True` so new frames are appended rather than overwriting:
-
-```python
-from ase.io import read
-from ase.calculators.emt import EMT
-from saddleclimb_ase import SaddleClimb
-
-atoms_initial = read('../../init/opt.traj')
-atoms_initial.calc = EMT()
-atoms_final = read('../../final/opt.traj')
-
-climber = SaddleClimb(
-    atoms_initial, atoms_final,
-    restart='climb.traj',
-    append_trajectory=True,
-)
-climber.run(fmax=0.01)
-```
-
-The `target_indices` argument works the same way as in the standalone interface:
-
-```python
-climber = SaddleClimb(atoms_initial, atoms_final, target_indices=[36])
-climber.run(fmax=0.01)
-```
-
-To see a complete example using the ASE optimizer interface see: [here](https://github.com/kirkbadger18/SaddleClimb/tree/main/examples/minimal_using_EMT/saddleclimb_ase).
-
-The log file produced by the ASE interface uses ASE's standard optimizer format:
-```
-             Step     Time          Energy          fmax
-SaddleClimb:    0 16:55:55        7.162017        0.000889
-SaddleClimb:    1 16:55:55        7.162922        0.037283
-SaddleClimb:    2 16:55:55        7.165460        0.079191
-...
-SaddleClimb:   20 16:55:55        7.211647        0.004541
-```
 
 ## SaddleClimb output
 The output from Saddleclimb is two files: climb.log, and climb.traj. In climb.log, the iteration number, energy, and fmax values are stored after each gradient call to the ASE calculator supplied. For the above example this looks like:
