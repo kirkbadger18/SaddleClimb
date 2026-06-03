@@ -17,6 +17,7 @@ class SaddleClimb:
             atoms_initial: Atoms,
             atoms_final: Atoms,
             calculator: Calculator,
+            min_directed_steps: int = 5,
             target_indices: list = None,
             fmax: float = 0.01,
             maxstepsize: float = 0.2,
@@ -29,6 +30,7 @@ class SaddleClimb:
         self.atoms_final = atoms_final
         self.target_indices = target_indices
         self.calculator = calculator
+        self.min_directed_steps = min_directed_steps
         self.fmax = fmax
         self.maxstepsize = maxstepsize
         self.delta = delta0
@@ -55,7 +57,7 @@ class SaddleClimb:
                 sub_indices.append(i)
         self.sub_target_indices = sub_indices.copy()
 
-    def _get_step(self, B, g, pos_1D):
+    def _get_step(self, B, g, pos_1D, n):
         dxi = self._pos_i_1D - pos_1D
         dxf = self._pos_f_1D - pos_1D
         dxi_to_f = self._pos_f_1D - self._pos_i_1D
@@ -64,7 +66,7 @@ class SaddleClimb:
         if np.dot(g, dxi) < 0 and np.dot(g, dxf) < 0:
             eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
             self._climbing = False
-        elif eigs_B[0] < 0:
+        elif eigs_B[0] < 0 and n > self.min_directed_steps:
             eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
         else:
             first_column = dxi_to_f.copy()
@@ -212,15 +214,15 @@ class SaddleClimb:
     def climb(self: None, maxsteps=None) -> None:
         self._initialize_logging()
         if self._restart:
+            n = self._restart_trajectory.info['saddleclimb_iterations']
             atoms, idx, B = self._initialize_atoms_restart()
             traj, g, E, Fmax = self._initialize_run_restart(idx)
             self._pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
             self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
-            dx_1D = self._get_step(B, g, atoms.positions[idx, :].reshape(-1))
+            dx_1D = self._get_step(B, g, atoms.positions[idx, :].reshape(-1), n)
             dx = dx_1D.reshape(-1, 3)
             pos_1D = atoms.positions[idx, :].reshape(-1)
             dxi = LA.norm(self._pos_i_1D - pos_1D)
-            n = self._restart_trajectory.info['saddleclimb_iterations']
         else:
             atoms, idx, B = self._initialize_atoms()
             traj, g, E = self._initialize_run(atoms, idx)
@@ -236,7 +238,7 @@ class SaddleClimb:
             dg = g - g0
             Fmax = LA.norm(-g.reshape(-1, 3), axis=1).max()
             B = self._update_hessian(B, dg, dx_1D)
-            dx_1D = self._get_step(B, g, pos_1D)
+            dx_1D = self._get_step(B, g, pos_1D, n)
             dx = dx_1D.reshape(-1, 3)
             n += 1
             log_string = self._get_log_string(n, E, Fmax)
