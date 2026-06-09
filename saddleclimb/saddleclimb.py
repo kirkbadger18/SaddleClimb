@@ -231,7 +231,7 @@ class SaddleClimb:
             traj, g, E = self._initialize_run(atoms, idx)
             dx, dx_1D = self._get_initial_step(idx)
             Fmax, dxi, n = 1, 0, 0
-        while Fmax > self.fmax or dxi < 0.5:
+        while Fmax > self.fmax or dxi < 0.1:
             atoms.positions[idx, :] += dx
             pos_1D = atoms.positions[idx, :].reshape(-1)
             dxi = LA.norm(self._pos_i_1D - pos_1D)
