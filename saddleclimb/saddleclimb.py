@@ -66,7 +66,7 @@ class SaddleClimb:
         eigs_B, vecs_B = LA.eigh(B)
         self._climbing = True
         min_eig = self.eigenvalue_floor
-        if np.dot(g, dxi) < -min_eig and np.dot(g, dxf) < 0:
+        if np.dot(g, dxi) < 0 and np.dot(g, dxf) < 0:
             eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
             self._climbing = False
         elif eigs_B[0] < -min_eig and n > self.min_directed_steps:
@@ -85,7 +85,7 @@ class SaddleClimb:
             eigs_tmp, vecs_tmp = LA.eigh(B_new)
         for i, eig in enumerate(eigs_tmp):
             if i == 0 and self._climbing:
-                eigs_tmp[i] = - np.abs(eig)
+                eigs_tmp[i] = - max(np.abs(eig), min_eig)
             else:
                 eigs_tmp[i] = max(np.abs(eig), min_eig)
         Dmat = np.diag(eigs_tmp)
