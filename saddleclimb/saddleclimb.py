@@ -22,6 +22,7 @@ class SaddleClimb:
             fmax: float = 0.01,
             maxstepsize: float = 0.2,
             delta0: float = 0.05,
+            eigenvalue_floor: float = 0.05,
             logfile: str = 'climb.log',
             trajfile: str = 'climb.traj',
             ) -> None:
@@ -34,13 +35,14 @@ class SaddleClimb:
         self.fmax = fmax
         self.maxstepsize = maxstepsize
         self.delta = delta0
+        self.eigenvalue_floor = eigenvalue_floor
         self.logfile = logfile
         self.trajfile = trajfile
         self._restart = False
         self._get_moving_atoms()
         if self.target_indices:
             self._get_sub_taret_atoms()
-        self.hessian = 100 * np.eye(3*len(self.indices))
+        self.hessian = 25 * np.eye(3*len(self.indices))
 
     def _get_moving_atoms(self):
         dpos = self.atoms_final.positions - self.atoms_initial.positions
@@ -63,10 +65,11 @@ class SaddleClimb:
         dxi_to_f = self._pos_f_1D - self._pos_i_1D
         eigs_B, vecs_B = LA.eigh(B)
         self._climbing = True
-        if np.dot(g, dxi) < 0 and np.dot(g, dxf) < 0:
+        min_eig = self.eigenvalue_floor
+        if np.dot(g, dxi) < -min_eig and np.dot(g, dxf) < 0:
             eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
             self._climbing = False
-        elif eigs_B[0] < 0 and n > self.min_directed_steps:
+        elif eigs_B[0] < -min_eig and n > self.min_directed_steps:
             eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
         else:
             first_column = dxi_to_f.copy()
@@ -74,7 +77,7 @@ class SaddleClimb:
                 for i in range(len(self.indices)):
                     if i not in self.sub_target_indices:
                         first_column[3*i:3*i+3] = 0
-            new_basis, R = LA.qr(first_column.reshape(len(dxi_to_f), 1),
+            new_basis, _ = LA.qr(first_column.reshape(len(dxi_to_f), 1),
                                  mode='complete')
             B_transformed = mult(new_basis.T, mult(B, new_basis))
             B_transformed[1:, 0], B_transformed[0, 1:] = 0, 0
@@ -84,7 +87,7 @@ class SaddleClimb:
             if i == 0 and self._climbing:
                 eigs_tmp[i] = - np.abs(eig)
             else:
-                eigs_tmp[i] = np.abs(eig)
+                eigs_tmp[i] = max(np.abs(eig), min_eig)
         Dmat = np.diag(eigs_tmp)
         B_temp = mult(vecs_tmp, mult(Dmat, vecs_tmp.T))
         sys.stdout.flush()
@@ -93,8 +96,7 @@ class SaddleClimb:
         maxstep = 0
         for i in range(len(self.indices)):
             stepsize = LA.norm(dx_1D[3*i:3*i+3])
-            if stepsize > maxstep:
-                maxstep = stepsize
+            maxstep = max(stepsize, maxstep)
         if maxstep > self.maxstepsize:
             dx_1D *= self.maxstepsize / maxstep
 
@@ -240,6 +242,7 @@ class SaddleClimb:
             E = atoms.calc.results['energy']
             dg = g - g0
             Fmax = LA.norm(-g.reshape(-1, 3), axis=1).max()
+
             B = self._update_hessian(B, dg, dx_1D)
             dx_1D = self._get_step(B, g, pos_1D, n)
             dx = dx_1D.reshape(-1, 3)
