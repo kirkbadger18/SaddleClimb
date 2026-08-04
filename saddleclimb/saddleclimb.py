@@ -22,7 +22,6 @@ class SaddleClimb:
             fmax: float = 0.01,
             maxstepsize: float = 0.2,
             delta0: float = 0.05,
-            eigenvalue_floor: float = 0.05,
             logfile: str = 'climb.log',
             trajfile: str = 'climb.traj',
             ) -> None:
@@ -35,7 +34,6 @@ class SaddleClimb:
         self.fmax = fmax
         self.maxstepsize = maxstepsize
         self.delta = delta0
-        self.eigenvalue_floor = eigenvalue_floor
         self.logfile = logfile
         self.trajfile = trajfile
         self._restart = False
@@ -59,17 +57,19 @@ class SaddleClimb:
                 sub_indices.append(i)
         self.sub_target_indices = sub_indices.copy()
 
-    def _get_step(self, B, g, pos_1D, n):
-        dxi = self._pos_i_1D - pos_1D
-        dxf = self._pos_f_1D - pos_1D
+    def _get_B_opt(self, B, g, pos_1D, n):
+
+        # dxi = self._pos_i_1D - pos_1D
+        # dxf = self._pos_f_1D - pos_1D
         dxi_to_f = self._pos_f_1D - self._pos_i_1D
         eigs_B, vecs_B = LA.eigh(B)
-        self._climbing = True
-        min_eig = self.eigenvalue_floor
-        if np.dot(g, dxi) < 0 and np.dot(g, dxf) < 0:
-            eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
-            self._climbing = False
-        elif eigs_B[0] < -min_eig and n > self.min_directed_steps:
+        # self._climbing = True
+        # min_eig = self.eigenvalue_floor
+        # if np.dot(g, dxi) < 0 and np.dot(g, dxf) < 0:
+        #    eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
+        #    self._climbing = False
+        #    print('a')
+        if eigs_B[0] < 0 and n > self.min_directed_steps:
             eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
         else:
             first_column = dxi_to_f.copy()
@@ -84,14 +84,17 @@ class SaddleClimb:
             B_new = mult(new_basis, mult(B_transformed, new_basis.T))
             eigs_tmp, vecs_tmp = LA.eigh(B_new)
         for i, eig in enumerate(eigs_tmp):
-            if i == 0 and self._climbing:
-                eigs_tmp[i] = - max(np.abs(eig), min_eig)
+            if i == 0:  # and self._climbing:
+                eigs_tmp[i] = - np.abs(eig)
             else:
-                eigs_tmp[i] = max(np.abs(eig), min_eig)
+                eigs_tmp[i] = np.abs(eig)
         Dmat = np.diag(eigs_tmp)
-        B_temp = mult(vecs_tmp, mult(Dmat, vecs_tmp.T))
-        sys.stdout.flush()
-        inv_B_temp = LA.inv(B_temp)
+        B_opt = mult(vecs_tmp, mult(Dmat, vecs_tmp.T))
+        return B_opt
+
+    def _get_newton_step(self, B_opt, g):
+
+        inv_B_temp = LA.inv(B_opt)
         dx_1D = -mult(inv_B_temp, g)
         maxstep = 0
         for i in range(len(self.indices)):
@@ -101,6 +104,32 @@ class SaddleClimb:
             dx_1D *= self.maxstepsize / maxstep
 
         return dx_1D
+
+    def _get_pfro_step(self, B_opt, g, a):
+
+        _, vecs = LA.eigh(B_opt)
+        vmin, vmax = vecs[:, 1:], vecs[:, 0]
+        Ndim = len(g)
+        climb_M = np.array([
+            [a**2*mult(vmax.T, mult(B_opt, vmax)), a*mult(vmax.T, g)],
+            [a*mult(g.T, vmax), 0]
+        ])
+        descend_M = np.zeros([Ndim, Ndim])
+        descend_M[0:Ndim-1, 0:Ndim-1] = a**2*mult(vmin.T, mult(B_opt, vmin))
+        descend_M[-1, 0:Ndim-1] = a*mult(vmin.T, g)
+        descend_M[0:Ndim-1, -1] = a*mult(g.T, vmin)
+        _, svecs_min = LA.eigh(descend_M)
+        _, svecs_max = LA.eigh(climb_M)
+        smax = a*svecs_max[0, 1] / svecs_max[1, 1]
+        smin = (a / svecs_min[-1, 0]) * svecs_min[0:Ndim-1, 0]
+        step = smax * vmax + mult(vmin, smin)
+        maxstep = 0
+        for i in range(len(self.indices)):
+            stepsize = LA.norm(step[3*i:3*i+3])
+            maxstep = max(stepsize, maxstep)
+        if maxstep > self.maxstepsize:
+            step *= self.maxstepsize / maxstep
+        return step
 
     def _update_hessian(
             self: None, B_old: np.ndarray,
@@ -244,7 +273,8 @@ class SaddleClimb:
             Fmax = LA.norm(-g.reshape(-1, 3), axis=1).max()
 
             B = self._update_hessian(B, dg, dx_1D)
-            dx_1D = self._get_step(B, g, pos_1D, n)
+            B_opt = self._get_B_opt(B, g, pos_1D, n)
+            dx_1D = self._get_pfro_step(B_opt, g, a=10)
             dx = dx_1D.reshape(-1, 3)
             n += 1
             log_string = self._get_log_string(n, E, Fmax)
