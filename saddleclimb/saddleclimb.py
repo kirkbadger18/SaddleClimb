@@ -37,10 +37,11 @@ class SaddleClimb:
         self.logfile = logfile
         self.trajfile = trajfile
         self._restart = False
+        self._directed = True
         self._get_moving_atoms()
         if self.target_indices:
             self._get_sub_taret_atoms()
-        self.hessian = 100 * np.eye(3*len(self.indices))
+        self.hessian = 25 * np.eye(3*len(self.indices))
 
     def _get_moving_atoms(self):
         dpos = self.atoms_final.positions - self.atoms_initial.positions
@@ -57,21 +58,11 @@ class SaddleClimb:
                 sub_indices.append(i)
         self.sub_target_indices = sub_indices.copy()
 
-    def _get_B_opt(self, B, g, pos_1D, n):
+    def _get_B_opt(self, B, g, n):
 
-        # dxi = self._pos_i_1D - pos_1D
-        # dxf = self._pos_f_1D - pos_1D
         dxi_to_f = self._pos_f_1D - self._pos_i_1D
         eigs_B, vecs_B = LA.eigh(B)
-        # self._climbing = True
-        # min_eig = self.eigenvalue_floor
-        # if np.dot(g, dxi) < 0 and np.dot(g, dxf) < 0:
-        #    eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
-        #    self._climbing = False
-        #    print('a')
-        if eigs_B[0] < 0 and n > self.min_directed_steps:
-            eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
-        else:
+        if (eigs_B[0] > 0 or n <= self.min_directed_steps) and self._directed:
             first_column = dxi_to_f.copy()
             if self.target_indices:
                 for i in range(len(self.indices)):
@@ -83,8 +74,12 @@ class SaddleClimb:
             B_transformed[1:, 0], B_transformed[0, 1:] = 0, 0
             B_new = mult(new_basis, mult(B_transformed, new_basis.T))
             eigs_tmp, vecs_tmp = LA.eigh(B_new)
+        else:
+            eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
+            self._directed = False
+
         for i, eig in enumerate(eigs_tmp):
-            if i == 0:  # and self._climbing:
+            if i == 0:
                 eigs_tmp[i] = - np.abs(eig)
             else:
                 eigs_tmp[i] = np.abs(eig)
@@ -176,6 +171,7 @@ class SaddleClimb:
         atoms.calc = copy.deepcopy(self.calculator)
         idx = self.indices.copy()
         B_init = np.array(atoms.info["saddleclimb_hessian"])
+
         return atoms, idx, B_init
 
     def _initialize_run(self: None, atoms: Atoms, idx: list):
@@ -246,14 +242,13 @@ class SaddleClimb:
         self._initialize_logging()
         if self._restart:
             n = self._restart_trajectory.info['saddleclimb_iterations']
+            self._directed = self._restart_trajectory.info['directed']
             atoms, idx, B = self._initialize_atoms_restart()
             traj, g, E, Fmax = self._initialize_run_restart(idx)
             self._pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
             self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
-            dx_1D = self._get_step(B,
-                                   g,
-                                   atoms.positions[idx, :].reshape(-1),
-                                   n)
+            B_opt = self._get_B_opt(B, g, n-1)
+            dx_1D = self._get_pfro_step(B_opt, g, a=1)
             dx = dx_1D.reshape(-1, 3)
             pos_1D = atoms.positions[idx, :].reshape(-1)
             dxi = LA.norm(self._pos_i_1D - pos_1D)
@@ -273,8 +268,8 @@ class SaddleClimb:
             Fmax = LA.norm(-g.reshape(-1, 3), axis=1).max()
 
             B = self._update_hessian(B, dg, dx_1D)
-            B_opt = self._get_B_opt(B, g, pos_1D, n)
-            dx_1D = self._get_pfro_step(B_opt, g, a=10)
+            B_opt = self._get_B_opt(B, g, n)
+            dx_1D = self._get_pfro_step(B_opt, g, a=1)
             dx = dx_1D.reshape(-1, 3)
             n += 1
             log_string = self._get_log_string(n, E, Fmax)
@@ -282,6 +277,7 @@ class SaddleClimb:
             atoms.info["saddleclimb_hessian"] = B.tolist()
             atoms.info["saddleclimb_hessian_shape"] = B.shape
             atoms.info['saddleclimb_iterations'] = n + 0
+            atoms.info['directed'] = self._directed
             traj.write(atoms)
             if maxsteps and n >= maxsteps:
                 break
