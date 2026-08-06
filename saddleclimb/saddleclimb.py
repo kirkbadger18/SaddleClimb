@@ -41,7 +41,7 @@ class SaddleClimb:
         self._get_moving_atoms()
         if self.target_indices:
             self._get_sub_taret_atoms()
-        self.hessian = 25 * np.eye(3*len(self.indices))
+        self.hessian = 100 * np.eye(3*len(self.indices))
 
     def _get_moving_atoms(self):
         dpos = self.atoms_final.positions - self.atoms_initial.positions
