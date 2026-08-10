@@ -141,3 +141,33 @@ def test_initialize_atoms():
     assert climber.calculator.results == atoms_test.calc.results
     assert climber.indices == idx_test
     assert_allclose(climber.hessian, B_test)
+
+
+def test_directed_vector_uses_minimum_image():
+    """
+    An adsorbate that hops across a periodic boundary must give a directed
+    climbing vector that follows the short way round the cell.  Taking the
+    raw difference instead sends the directed climb off along an unrelated
+    direction.
+    """
+    calc = EMT()
+    init = fcc111('Pt', size=(3, 3, 4), vacuum=10.0)
+    final = fcc111('Pt', size=(3, 3, 4), vacuum=10.0)
+    add_adsorbate(init, 'H', 1.5, 'fcc')
+    add_adsorbate(final, 'H', 1.5, 'fcc')
+    # move the adsorbate one full cell vector, i.e. back onto itself
+    final.positions[-1] += init.cell[0]
+
+    climber = SaddleClimb(init, final, calc)
+    raw = final.positions - init.positions
+    assert LA.norm(raw[-1]) > 1.0
+    assert_allclose(climber._dpos, np.zeros_like(climber._dpos), atol=1e-8)
+
+    # a genuine hop to the neighbouring hcp site, wrapped round the boundary
+    final.positions[-1] = init.positions[-1] - init.cell[0]
+    final.positions[-1, 1] += 0.5
+    climber = SaddleClimb(init, final, calc)
+    idx = climber.indices
+    climber._get_initial_step(idx)
+    directed = climber._pos_f_1D - climber._pos_i_1D
+    assert LA.norm(directed) == pytest.approx(0.5, abs=1e-8)
