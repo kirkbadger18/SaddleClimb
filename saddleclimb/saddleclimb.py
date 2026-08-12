@@ -63,9 +63,9 @@ class SaddleClimb:
                 sub_indices.append(i)
         self.sub_target_indices = sub_indices.copy()
 
-    def _get_B_opt(self, B, g, n):
+    def _get_B_opt(self, B, pos_1D, n):
 
-        dxi_to_f = self._pos_f_1D - self._pos_i_1D
+        dxi_to_f = self._pos_f_1D - pos_1D
         eigs_B, vecs_B = LA.eigh(B)
         if (eigs_B[0] > 0 or n <= self.min_directed_steps) and self._directed:
             first_column = dxi_to_f.copy()
@@ -309,11 +309,11 @@ class SaddleClimb:
             traj, g, E, Fmax = self._initialize_run_restart(idx)
             self._pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
             self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
-            B_opt = self._get_B_opt(B, g, n-1)
-            dx_1D = self._get_pfro_step(B_opt, g)
-            dx = dx_1D.reshape(-1, 3)
             pos_1D = atoms.positions[idx, :].reshape(-1)
             dxi = LA.norm(self._pos_i_1D - pos_1D)
+            B_opt = self._get_B_opt(B, pos_1D, n-1)
+            dx_1D = self._get_pfro_step(B_opt, g)
+            dx = dx_1D.reshape(-1, 3)
         else:
             atoms, idx, B = self._initialize_atoms()
             traj, g, E = self._initialize_run(atoms, idx)
@@ -330,7 +330,7 @@ class SaddleClimb:
             Fmax = LA.norm(-g.reshape(-1, 3), axis=1).max()
 
             B = self._update_hessian(B, dg, dx_1D)
-            B_opt = self._get_B_opt(B, g, n)
+            B_opt = self._get_B_opt(B, pos_1D, n)
             dx_1D = self._get_pfro_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
             n += 1
