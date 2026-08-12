@@ -5,7 +5,6 @@ import numpy.linalg as LA
 from numpy import matmul as mult
 from ase.atoms import Atoms
 from ase.calculators.calculator import Calculator
-from ase.geometry import find_mic
 from ase.io.trajectory import Trajectory
 from scipy.optimize import brentq
 from pathlib import Path
@@ -44,26 +43,13 @@ class SaddleClimb:
         self.trajfile = trajfile
         self._restart = False
         self._directed = True
-        self._dpos = self._get_dpos()
         self._get_moving_atoms()
         if self.target_indices:
             self._get_sub_target_atoms()
         self.hessian = 100 * np.eye(3*len(self.indices))
 
-    def _get_dpos(self) -> np.ndarray:
-        """
-        Displacement from the initial to the final image under the minimum
-        image convention.  An atom whose path crosses a periodic boundary
-        has a raw displacement that runs the long way round the cell, which
-        would point the directed climb away from the reaction coordinate.
-        """
-        dpos = self.atoms_final.positions - self.atoms_initial.positions
-        dpos, _ = find_mic(dpos, self.atoms_initial.cell,
-                           pbc=self.atoms_initial.pbc)
-        return dpos
-
     def _get_moving_atoms(self):
-        dpos = self._dpos
+        dpos = self.atoms_final.positions - self.atoms_initial.positions
         idx = []
         for i in range(dpos.shape[0]):
             if LA.norm(dpos[i, :]) > 1e-6:
@@ -268,20 +254,11 @@ class SaddleClimb:
         Fmax = LA.norm(-g.reshape(-1, 3), axis=1).max()
         return traj, g, E, Fmax
 
-    def _set_reference_positions(self: None, idx: list) -> None:
-        """
-        ``_pos_f_1D`` is the periodic image of the final structure that lies
-        closest to the initial one, so that ``_pos_f_1D - _pos_i_1D`` is the
-        minimum image displacement everywhere it is used as the directed
-        climbing direction.
-        """
-        self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
-        self._pos_f_1D = self._pos_i_1D + self._dpos[idx, :].reshape(-1)
-
     def _get_initial_step(
             self: None, idx: list
             ) -> tuple[np.ndarray, np.ndarray]:
-        self._set_reference_positions(idx)
+        self._pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
+        self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
         dx_1D = self.delta * self.normalize(self._pos_f_1D - self._pos_i_1D)
         if self.target_indices:
             for i in range(len(self.indices)):
@@ -330,7 +307,8 @@ class SaddleClimb:
             self._directed = self._restart_trajectory.info['directed']
             atoms, idx, B = self._initialize_atoms_restart()
             traj, g, E, Fmax = self._initialize_run_restart(idx)
-            self._set_reference_positions(idx)
+            self._pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
+            self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
             B_opt = self._get_B_opt(B, g, n-1)
             dx_1D = self._get_pfro_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
