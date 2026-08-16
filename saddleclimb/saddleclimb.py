@@ -105,13 +105,13 @@ class SaddleClimb:
             self,
             initial_atoms: Atoms,
             final_atoms: Atoms,
-            num_images: int = 5,
+            num_images: int = 9,
             ) -> np.ndarray:
 
         images = [initial_atoms.copy() for _ in range(num_images - 1)]
         images.append(final_atoms.copy())
         neb = NEB(images)
-        neb.interpolate(mic=True)
+        neb.interpolate(mic=False)
         idpp_interpolate(neb, fmax=0.001, mic=False, log=None, traj=None)
         pos_0 = images[0].get_positions()
         pos_1 = images[1].get_positions()
