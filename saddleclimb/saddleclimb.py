@@ -58,7 +58,7 @@ class SaddleClimb:
         dpos = self.atoms_final.positions - self.atoms_initial.positions
         idx = []
         for i in range(dpos.shape[0]):
-            if LA.norm(dpos[i, :]) > 1e-1:
+            if LA.norm(dpos[i, :]) > 1e-6:
                 idx.append(i)
         self.indices = idx.copy()
 
@@ -105,12 +105,12 @@ class SaddleClimb:
             self,
             initial_atoms: Atoms,
             final_atoms: Atoms,
-            num_images: int = 5,
+            num_images: int = 3,
             ) -> np.ndarray:
 
         images = [initial_atoms.copy() for _ in range(num_images)]
         images[-1] = final_atoms.copy()
-        idpp_interpolate(images, fmax=0.001, log=None, traj=None)
+        idpp_interpolate(images, fmax=0.01, mic=True, log=None, traj=None)
         pos_0 = images[0].get_positions()
         pos_1 = images[1].get_positions()
         disp = (pos_1 - pos_0)[self.indices, :].copy()
@@ -357,7 +357,8 @@ class SaddleClimb:
             Fmax = LA.norm(-g.reshape(-1, 3), axis=1).max()
 
             B = self._update_hessian(B, dg, dx_1D)
-            bias_dx = self._get_idpp_bias_vector(atoms, self.atoms_final)
+            if self._directed:
+                bias_dx = self._get_idpp_bias_vector(atoms, self.atoms_final)
             B_opt = self._get_B_opt(B, bias_dx, n)
             if self.step_method == 'pfro':
                 dx_1D = self._get_pfro_step(B_opt, g)
