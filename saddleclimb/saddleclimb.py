@@ -10,6 +10,7 @@ from ase.io.trajectory import Trajectory
 from scipy.optimize import brentq
 from pathlib import Path
 import copy
+from ase.mep.neb import idpp_interpolate
 
 
 class SaddleClimb:
@@ -19,7 +20,8 @@ class SaddleClimb:
             atoms_initial: Atoms,
             atoms_final: Atoms,
             calculator: Calculator,
-            method: str = 'pfro',
+            step_method: str = 'pfro',
+            interp_method: str = 'idpp',
             min_directed_steps: int = 5,
             target_indices: list = None,
             fmax: float = 0.01,
@@ -35,7 +37,8 @@ class SaddleClimb:
         self.atoms_final = atoms_final
         self.target_indices = target_indices
         self.calculator = calculator
-        self.method = method
+        self.step_method = step_method
+        self.interp_method = interp_method
         self.min_directed_steps = min_directed_steps
         self.fmax = fmax
         self.maxstepsize = maxstepsize
@@ -66,17 +69,16 @@ class SaddleClimb:
                 sub_indices.append(i)
         self.sub_target_indices = sub_indices.copy()
 
-    def _get_B_opt(self, B, n):
+    def _get_B_opt(self, B, bias_dx, n):
 
-        dxi_to_f = self._pos_f_1D - self._pos_f_1D
         eigs_B, vecs_B = LA.eigh(B)
         if (eigs_B[0] > 0 or n <= self.min_directed_steps) and self._directed:
-            first_column = dxi_to_f.copy()
+            first_column = bias_dx.copy()
             if self.target_indices:
                 for i in range(len(self.indices)):
                     if i not in self.sub_target_indices:
                         first_column[3*i:3*i+3] = 0
-            new_basis, _ = LA.qr(first_column.reshape(len(dxi_to_f), 1),
+            new_basis, _ = LA.qr(first_column.reshape(len(bias_dx), 1),
                                  mode='complete')
             B_transformed = mult(new_basis.T, mult(B, new_basis))
             B_transformed[1:, 0], B_transformed[0, 1:] = 0, 0
@@ -98,6 +100,22 @@ class SaddleClimb:
     def _get_maxstep(self, dx_1D: np.ndarray) -> float:
         """Largest single-atom displacement in a flattened step."""
         return LA.norm(dx_1D.reshape(-1, 3), axis=1).max()
+
+    def _get_idpp_bias_vector(
+            self,
+            initial_atoms: Atoms,
+            final_atoms: Atoms,
+            num_images: int = 5,
+            ) -> np.ndarray:
+
+        images = [initial_atoms.copy() for _ in range(num_images)]
+        images[-1] = final_atoms.copy()
+        idpp_interpolate(images, fmax=0.001, log=None, traj=None)
+        pos_0 = images[0].get_positions()
+        pos_1 = images[1].get_positions()
+        disp = (pos_1 - pos_0)[self.indices, :].copy()
+        bias_vector = self.normalize(disp.reshape(-1))
+        return bias_vector
 
     def _get_newton_step(self, B_opt, g):
 
@@ -260,9 +278,13 @@ class SaddleClimb:
     def _get_initial_step(
             self: None, idx: list
             ) -> tuple[np.ndarray, np.ndarray]:
+        if self.interp_method == 'idpp':
+            dx_1D = self.delta * self._get_idpp_bias_vector(self.atoms_initial,
+                                                            self.atoms_final,
+                                                            )
         self._pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
         self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
-        dx_1D = self.delta * self.normalize(self._pos_f_1D - self._pos_i_1D)
+        # dx_1D = self.delta * self.normalize(self._pos_f_1D - self._pos_i_1D)
         if self.target_indices:
             for i in range(len(self.indices)):
                 if i not in self.sub_target_indices:
@@ -314,7 +336,8 @@ class SaddleClimb:
             self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
             pos_1D = atoms.positions[idx, :].reshape(-1)
             dxi = LA.norm(self._pos_i_1D - pos_1D)
-            B_opt = self._get_B_opt(B, n-1)
+            bias_dx = self._get_idpp_bias_vector(atoms, self.atoms_final)
+            B_opt = self._get_B_opt(B, bias_dx, n-1)
             dx_1D = self._get_pfro_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
         else:
@@ -334,10 +357,11 @@ class SaddleClimb:
             Fmax = LA.norm(-g.reshape(-1, 3), axis=1).max()
 
             B = self._update_hessian(B, dg, dx_1D)
-            B_opt = self._get_B_opt(B, n)
-            if self.method == 'pfro':
+            bias_dx = self._get_idpp_bias_vector(atoms, self.atoms_final)
+            B_opt = self._get_B_opt(B, bias_dx, n)
+            if self.step_method == 'pfro':
                 dx_1D = self._get_pfro_step(B_opt, g)
-            elif self.method == 'newton':
+            elif self.step_method == 'newton':
                 dx_1D = self._get_newton_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
             n += 1
