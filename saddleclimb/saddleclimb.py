@@ -19,6 +19,7 @@ class SaddleClimb:
             atoms_initial: Atoms,
             atoms_final: Atoms,
             calculator: Calculator,
+            method: str='pfro',
             min_directed_steps: int = 5,
             target_indices: list = None,
             fmax: float = 0.01,
@@ -34,6 +35,7 @@ class SaddleClimb:
         self.atoms_final = atoms_final
         self.target_indices = target_indices
         self.calculator = calculator
+        self.method = method
         self.min_directed_steps = min_directed_steps
         self.fmax = fmax
         self.maxstepsize = maxstepsize
@@ -333,7 +335,10 @@ class SaddleClimb:
 
             B = self._update_hessian(B, dg, dx_1D)
             B_opt = self._get_B_opt(B, n)
-            dx_1D = self._get_pfro_step(B_opt, g)
+            if self.method == 'pfro':
+                dx_1D = self._get_pfro_step(B_opt, g)
+            elif self.method == 'newton':
+                dx_1D = self._get_newton_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
             n += 1
             log_string = self._get_log_string(n, E, Fmax)
