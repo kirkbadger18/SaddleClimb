@@ -6,6 +6,7 @@ from numpy import matmul as mult
 from ase.atoms import Atoms
 from ase.calculators.calculator import Calculator
 from ase.io.trajectory import Trajectory
+from scipy.optimize import brentq
 from pathlib import Path
 import copy
 
@@ -21,8 +22,9 @@ class SaddleClimb:
             target_indices: list = None,
             fmax: float = 0.01,
             maxstepsize: float = 0.2,
+            a_max: float = 1,
+            max_scaling_halvings: int = 60,
             delta0: float = 0.05,
-            eigenvalue_floor: float = 0.05,
             logfile: str = 'climb.log',
             trajfile: str = 'climb.traj',
             ) -> None:
@@ -34,14 +36,16 @@ class SaddleClimb:
         self.min_directed_steps = min_directed_steps
         self.fmax = fmax
         self.maxstepsize = maxstepsize
+        self.a_max = a_max
+        self.max_scaling_halvings = max_scaling_halvings
         self.delta = delta0
-        self.eigenvalue_floor = eigenvalue_floor
         self.logfile = logfile
         self.trajfile = trajfile
         self._restart = False
+        self._directed = True
         self._get_moving_atoms()
         if self.target_indices:
-            self._get_sub_taret_atoms()
+            self._get_sub_target_atoms()
         self.hessian = 100 * np.eye(3*len(self.indices))
 
     def _get_moving_atoms(self):
@@ -52,26 +56,18 @@ class SaddleClimb:
                 idx.append(i)
         self.indices = idx.copy()
 
-    def _get_sub_taret_atoms(self):
+    def _get_sub_target_atoms(self):
         sub_indices = []
         for i in range(len(self.indices)):
             if self.indices[i] in self.target_indices:
                 sub_indices.append(i)
         self.sub_target_indices = sub_indices.copy()
 
-    def _get_step(self, B, g, pos_1D, n):
-        dxi = self._pos_i_1D - pos_1D
-        dxf = self._pos_f_1D - pos_1D
-        dxi_to_f = self._pos_f_1D - self._pos_i_1D
+    def _get_B_opt(self, B, n):
+
+        dxi_to_f = self._pos_f_1D - self._pos_f_1D
         eigs_B, vecs_B = LA.eigh(B)
-        self._climbing = True
-        min_eig = self.eigenvalue_floor
-        if np.dot(g, dxi) < 0 and np.dot(g, dxf) < 0:
-            eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
-            self._climbing = False
-        elif eigs_B[0] < -min_eig and n > self.min_directed_steps:
-            eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
-        else:
+        if (eigs_B[0] > 0 or n <= self.min_directed_steps) and self._directed:
             first_column = dxi_to_f.copy()
             if self.target_indices:
                 for i in range(len(self.indices)):
@@ -83,24 +79,114 @@ class SaddleClimb:
             B_transformed[1:, 0], B_transformed[0, 1:] = 0, 0
             B_new = mult(new_basis, mult(B_transformed, new_basis.T))
             eigs_tmp, vecs_tmp = LA.eigh(B_new)
+        else:
+            eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
+            self._directed = False
+
         for i, eig in enumerate(eigs_tmp):
-            if i == 0 and self._climbing:
-                eigs_tmp[i] = - max(np.abs(eig), min_eig)
+            if i == 0:
+                eigs_tmp[i] = - np.abs(eig)
             else:
-                eigs_tmp[i] = max(np.abs(eig), min_eig)
+                eigs_tmp[i] = np.abs(eig)
         Dmat = np.diag(eigs_tmp)
-        B_temp = mult(vecs_tmp, mult(Dmat, vecs_tmp.T))
-        sys.stdout.flush()
-        inv_B_temp = LA.inv(B_temp)
+        B_opt = mult(vecs_tmp, mult(Dmat, vecs_tmp.T))
+        return B_opt
+
+    def _get_maxstep(self, dx_1D: np.ndarray) -> float:
+        """Largest single-atom displacement in a flattened step."""
+        return LA.norm(dx_1D.reshape(-1, 3), axis=1).max()
+
+    def _get_newton_step(self, B_opt, g):
+
+        inv_B_temp = LA.inv(B_opt)
         dx_1D = -mult(inv_B_temp, g)
-        maxstep = 0
-        for i in range(len(self.indices)):
-            stepsize = LA.norm(dx_1D[3*i:3*i+3])
-            maxstep = max(stepsize, maxstep)
+        maxstep = self._get_maxstep(dx_1D)
         if maxstep > self.maxstepsize:
             dx_1D *= self.maxstepsize / maxstep
 
         return dx_1D
+
+    def _get_scaled_pfro_step(self, B_opt, g, vmin, vmax, a):
+        """
+        Partitioned RFO step for a given RFO scaling parameter ``a``.
+
+        The step is maximised along ``vmax`` and minimised in the space
+        spanned by ``vmin``.  ``a`` acts as a trust radius control: the
+        step tends to zero as a -> 0 and to the full Newton/RFO step as
+        a -> inf.
+        """
+        Ndim = len(g)
+        climb_M = np.array([
+            [a**2*mult(vmax.T, mult(B_opt, vmax)), a*mult(vmax.T, g)],
+            [a*mult(g.T, vmax), 0]
+        ])
+        descend_M = np.zeros([Ndim, Ndim])
+        descend_M[0:Ndim-1, 0:Ndim-1] = a**2*mult(vmin.T, mult(B_opt, vmin))
+        descend_M[-1, 0:Ndim-1] = a*mult(vmin.T, g)
+        descend_M[0:Ndim-1, -1] = a*mult(g.T, vmin)
+        _, svecs_min = LA.eigh(descend_M)
+        _, svecs_max = LA.eigh(climb_M)
+        smax = a*svecs_max[0, 1] / svecs_max[1, 1]
+        smin = (a / svecs_min[-1, 0]) * svecs_min[0:Ndim-1, 0]
+        step = smax * vmax + mult(vmin, smin)
+        return step
+
+    def _get_pfro_scaling(self, B_opt, g, vmin, vmax):
+        """
+        Pick the RFO scaling ``a``, starting from the nominal
+        ``self.a_max`` and reducing it only if that step would leave the
+        trust radius ``self.maxstepsize``.
+
+        Near convergence the nominal step is already well inside the
+        radius -- it approaches the Newton step, which shrinks with the
+        gradient -- so no search happens and ``a_max`` is returned as is.
+        When the radius does bind, the step length shrinks monotonically
+        as ``a`` is reduced, so ``a`` is halved until the step is inside
+        the radius and the resulting bracket is closed with Brent's
+        method.  Searching in log(a) keeps the bracket well conditioned
+        when many halvings are needed.  Only linear algebra is involved,
+        no force evaluations.
+        """
+        def excess(log_a):
+            step = self._get_scaled_pfro_step(B_opt, g, vmin, vmax,
+                                              np.exp(log_a))
+            return self._get_maxstep(step) - self.maxstepsize
+
+        log_hi = np.log(self.a_max)
+        if excess(log_hi) <= 0:
+            return self.a_max
+
+        log_lo = log_hi
+        bracketed = False
+        for _ in range(self.max_scaling_halvings):
+            log_lo -= np.log(2)
+            if excess(log_lo) <= 0:
+                bracketed = True
+                break
+
+        if not bracketed:
+            return np.exp(log_lo)
+
+        log_a = brentq(excess, log_lo, log_hi, xtol=1e-3)
+        return np.exp(log_a)
+
+    def _get_pfro_step(self, B_opt, g, a=None):
+        """
+        Partitioned RFO step.  With ``a=None`` the nominal scaling
+        ``self.a_max`` is used, reduced only far enough to keep the step
+        within the trust radius; passing an explicit ``a`` skips that
+        entirely.  The linear truncation is kept as a safety net for the
+        case where no bracket could be found.
+        """
+        _, vecs = LA.eigh(B_opt)
+        vmin, vmax = vecs[:, 1:], vecs[:, 0]
+        if a is None:
+            a = self._get_pfro_scaling(B_opt, g, vmin, vmax)
+        step = self._get_scaled_pfro_step(B_opt, g, vmin, vmax, a)
+        maxstep = self._get_maxstep(step)
+        if maxstep > self.maxstepsize:
+            step *= self.maxstepsize / maxstep
+        return step
 
     def _update_hessian(
             self: None, B_old: np.ndarray,
@@ -147,6 +233,7 @@ class SaddleClimb:
         atoms.calc = copy.deepcopy(self.calculator)
         idx = self.indices.copy()
         B_init = np.array(atoms.info["saddleclimb_hessian"])
+
         return atoms, idx, B_init
 
     def _initialize_run(self: None, atoms: Atoms, idx: list):
@@ -217,17 +304,16 @@ class SaddleClimb:
         self._initialize_logging()
         if self._restart:
             n = self._restart_trajectory.info['saddleclimb_iterations']
+            self._directed = self._restart_trajectory.info['directed']
             atoms, idx, B = self._initialize_atoms_restart()
             traj, g, E, Fmax = self._initialize_run_restart(idx)
             self._pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
             self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
-            dx_1D = self._get_step(B,
-                                   g,
-                                   atoms.positions[idx, :].reshape(-1),
-                                   n)
-            dx = dx_1D.reshape(-1, 3)
             pos_1D = atoms.positions[idx, :].reshape(-1)
             dxi = LA.norm(self._pos_i_1D - pos_1D)
+            B_opt = self._get_B_opt(B, n-1)
+            dx_1D = self._get_pfro_step(B_opt, g)
+            dx = dx_1D.reshape(-1, 3)
         else:
             atoms, idx, B = self._initialize_atoms()
             traj, g, E = self._initialize_run(atoms, idx)
@@ -244,7 +330,8 @@ class SaddleClimb:
             Fmax = LA.norm(-g.reshape(-1, 3), axis=1).max()
 
             B = self._update_hessian(B, dg, dx_1D)
-            dx_1D = self._get_step(B, g, pos_1D, n)
+            B_opt = self._get_B_opt(B, n)
+            dx_1D = self._get_pfro_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
             n += 1
             log_string = self._get_log_string(n, E, Fmax)
@@ -252,6 +339,7 @@ class SaddleClimb:
             atoms.info["saddleclimb_hessian"] = B.tolist()
             atoms.info["saddleclimb_hessian_shape"] = B.shape
             atoms.info['saddleclimb_iterations'] = n + 0
+            atoms.info['directed'] = self._directed
             traj.write(atoms)
             if maxsteps and n >= maxsteps:
                 break
