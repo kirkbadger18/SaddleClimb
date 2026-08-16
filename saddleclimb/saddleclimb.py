@@ -68,7 +68,7 @@ class SaddleClimb:
 
     def _get_B_opt(self, B, n):
 
-        dxi_to_f = self._pos_f_1D - self._pos_f_1D
+        dxi_to_f = self._pos_f_1D - self._pos_i_1D
         eigs_B, vecs_B = LA.eigh(B)
         if (eigs_B[0] > 0 or n <= self.min_directed_steps) and self._directed:
             first_column = dxi_to_f.copy()
