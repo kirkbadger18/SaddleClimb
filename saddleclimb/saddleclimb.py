@@ -19,7 +19,7 @@ class SaddleClimb:
             atoms_initial: Atoms,
             atoms_final: Atoms,
             calculator: Calculator,
-            method: str='pfro',
+            method: str = 'pfro',
             min_directed_steps: int = 5,
             target_indices: list = None,
             fmax: float = 0.01,
