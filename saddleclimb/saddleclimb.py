@@ -10,7 +10,7 @@ from ase.io.trajectory import Trajectory
 from scipy.optimize import brentq
 from pathlib import Path
 import copy
-from ase.mep.neb import idpp_interpolate
+from ase.mep.neb import idpp_interpolate, NEB
 
 
 class SaddleClimb:
@@ -105,12 +105,14 @@ class SaddleClimb:
             self,
             initial_atoms: Atoms,
             final_atoms: Atoms,
-            num_images: int = 3,
+            num_images: int = 5,
             ) -> np.ndarray:
 
-        images = [initial_atoms.copy() for _ in range(num_images)]
-        images[-1] = final_atoms.copy()
-        idpp_interpolate(images, fmax=0.01, mic=True, log=None, traj=None)
+        images = [initial_atoms.copy() for _ in range(num_images - 1)]
+        images.append(final_atoms.copy())
+        neb = NEB(images)
+        neb.interpolate(mic=True)
+        idpp_interpolate(neb, fmax=0.001, mic=False, log=None, traj=None)
         pos_0 = images[0].get_positions()
         pos_1 = images[1].get_positions()
         disp = (pos_1 - pos_0)[self.indices, :].copy()
