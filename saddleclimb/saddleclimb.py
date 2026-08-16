@@ -5,6 +5,7 @@ import numpy.linalg as LA
 from numpy import matmul as mult
 from ase.atoms import Atoms
 from ase.calculators.calculator import Calculator
+from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io.trajectory import Trajectory
 from scipy.optimize import brentq
 from pathlib import Path
@@ -18,6 +19,7 @@ class SaddleClimb:
             atoms_initial: Atoms,
             atoms_final: Atoms,
             calculator: Calculator,
+            method: str = 'pfro',
             min_directed_steps: int = 5,
             target_indices: list = None,
             fmax: float = 0.01,
@@ -33,6 +35,7 @@ class SaddleClimb:
         self.atoms_final = atoms_final
         self.target_indices = target_indices
         self.calculator = calculator
+        self.method = method
         self.min_directed_steps = min_directed_steps
         self.fmax = fmax
         self.maxstepsize = maxstepsize
@@ -324,14 +327,18 @@ class SaddleClimb:
             pos_1D = atoms.positions[idx, :].reshape(-1)
             dxi = LA.norm(self._pos_i_1D - pos_1D)
             g0 = g
-            g = -self._get_F(atoms)[idx, :].reshape(-1)
+            f = self._get_F(atoms)
+            g = -f[idx, :].reshape(-1)
             E = atoms.calc.results['energy']
             dg = g - g0
             Fmax = LA.norm(-g.reshape(-1, 3), axis=1).max()
 
             B = self._update_hessian(B, dg, dx_1D)
             B_opt = self._get_B_opt(B, n)
-            dx_1D = self._get_pfro_step(B_opt, g)
+            if self.method == 'pfro':
+                dx_1D = self._get_pfro_step(B_opt, g)
+            elif self.method == 'newton':
+                dx_1D = self._get_newton_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
             n += 1
             log_string = self._get_log_string(n, E, Fmax)
@@ -340,7 +347,11 @@ class SaddleClimb:
             atoms.info["saddleclimb_hessian_shape"] = B.shape
             atoms.info['saddleclimb_iterations'] = n + 0
             atoms.info['directed'] = self._directed
-            traj.write(atoms)
+            # write a snapshot: some calculators (e.g. MACE) invalidate their
+            # results when atoms.info changes, which would drop the energy
+            image = atoms.copy()
+            image.calc = SinglePointCalculator(image, energy=E, forces=f)
+            traj.write(image)
             if maxsteps and n >= maxsteps:
                 break
 
