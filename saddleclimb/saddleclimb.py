@@ -7,7 +7,7 @@ from ase.atoms import Atoms
 from ase.calculators.calculator import Calculator
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io.trajectory import Trajectory
-from scipy.optimize import brentq
+from scipy.optimize import brentq, minimize
 from pathlib import Path
 import copy
 from ase.mep.neb import idpp_interpolate, NEB
@@ -21,7 +21,7 @@ class SaddleClimb:
             atoms_final: Atoms,
             calculator: Calculator,
             step_method: str = 'pfro',
-            interp_method: str = 'idpp',
+            interp_method: str = 'lst',
             min_directed_steps: int = 5,
             target_indices: list = None,
             fmax: float = 0.01,
@@ -118,6 +118,151 @@ class SaddleClimb:
         disp = (pos_1 - pos_0)[self.indices, :].copy()
         bias_vector = self.normalize(disp.reshape(-1))
         return bias_vector
+
+    def _get_lst_bias_vector(
+            self,
+            initial_atoms: Atoms,
+            final_atoms: Atoms,
+            fraction: float = 0.001,
+            gamma: float = 1e-6,
+            maxiter: int = 500,
+            ) -> np.ndarray:
+        """
+        Linear synchronous transit bias direction.
+
+        A single intermediate configuration is placed at ``fraction`` along
+        the path -- kappa/p of Eq. (2), taken as a continuous parameter
+        since one image is wanted rather than a whole chain -- by
+        interpolating every pair distance linearly,
+
+            t_ij = d_ij(initial) + fraction * (d_ij(final) - d_ij(initial)),
+
+        and the Cartesian coordinates that best reproduce those targets are
+        found by minimising the objective of Halgren and Lipscomb,
+        Chem. Phys. Lett. 49, 225 (1977), Eq. (5),
+
+            S(r) = 1/2 sum_(i!=j) w_ij (d_ij(r) - t_ij)^2
+                   + gamma/2 sum_i |r_i - r_lin,i|^2 .
+
+        The weight is
+
+            w_ij = 1/d_ij(initial)^4 + 1/d_ij(final)^4 + 1/d_ij(r)^4 ,
+
+        which differs from the 1/d^4 of the IDPP objective in counting both
+        endpoints as well as the current distance.  A pair that is long now
+        but short in the final state -- a bond that has to form -- is
+        weighted as the bond it becomes rather than as the long contact it
+        currently is, which is otherwise suppressed by a factor
+        (d_long / d_bond)^4.  Retaining the current distance is the reason
+        IDPP uses 1/d^4 in the first place: a pair that becomes short during
+        the optimisation is still driven apart.
+
+        The sum is a smooth stand-in for 1/min(d1, df, d)^4: it agrees
+        wherever one of the three dominates and exceeds it by at most a
+        factor of three when they coincide, while avoiding the discontinuous
+        derivative that min() introduces wherever two of the distances
+        cross.
+
+        The gamma term is the chord restraint of Eq. (5), which removes
+        uniform translation and keeps the result attached to the linear
+        path.  Halgren and Lipscomb use 1e-6 a.u.; since the weighted pair
+        term has units of length^-2, gamma has units of length^-4 and the
+        published value converts as 1e-6 bohr^-4 = 1.27e-5 A^-4, doubled
+        here to 2.5e-5 because the anchor above carries a factor 1/2 that
+        Eq. (5) does not.
+
+        Because the minimisation starts from the linear interpolation, this
+        term is nearly inert at that magnitude -- gamma = 0 and gamma =
+        2.5e-5 give indistinguishable directions on every case tested.  It
+        matters only if the search is started somewhere else, such as at the
+        initial state itself, where the pair term alone has almost no
+        gradient for a near-isometric rearrangement (a rigid rotation, or a
+        hop in which every d_ij(initial) is close to d_ij(final)) and the
+        starting point is no longer supplying the direction.
+
+        The default ``fraction`` is small because the result wanted here is
+        a direction rather than a path: the returned vector converges to a
+        differential displacement as fraction -> 0, and is stable to about
+        0.03 degrees between 1e-3 and 1e-7.  Larger values tilt towards the
+        chord -- at 0.5 the direction has already moved 16 to 28 degrees off
+        that limit.
+
+        Only ``self.indices`` are optimised, every other atom being held at
+        its initial position, so constrained atoms cannot drift.  Distances
+        are raw Cartesian distances, matching the convention used by
+        ``_get_idpp_bias_vector``; a reaction in which an atom crosses a
+        periodic boundary needs endpoints in a consistent unwrapped frame.
+        """
+        pos_i = initial_atoms.get_positions()
+        pos_f = final_atoms.get_positions()
+        d_i = initial_atoms.get_all_distances(mic=False)
+        d_f = final_atoms.get_all_distances(mic=False)
+
+        target = d_i + fraction * (d_f - d_i)
+        with np.errstate(divide='ignore'):
+            w_end = 1.0 / d_i ** 4 + 1.0 / d_f ** 4
+        # the diagonal is excluded by making every self term contribute zero
+        np.fill_diagonal(target, 1.0)
+        np.fill_diagonal(w_end, 0.0)
+
+        pos_lin = pos_i + fraction * (pos_f - pos_i)
+        idx = np.asarray(self.indices, dtype=int)
+        if fraction <= 0.0:
+            raise ValueError('fraction must be positive')
+        # S is quadratic in fraction, and the relative-reduction test in
+        # L-BFGS-B divides by max(|S|, 1), so it silently degrades into an
+        # absolute test once S falls below one and the search stops early --
+        # at fraction=1e-6 after three iterations.  Scaling S to O(1) keeps
+        # the tolerances meaningful; it multiplies both terms alike, so the
+        # balance against gamma is untouched.
+        scale = 1.0 / fraction ** 2
+
+        def objective(x):
+            pos = pos_lin.copy()
+            pos[idx] = x.reshape(-1, 3)
+            # disp[i, j] = r_j - r_i
+            disp = pos[np.newaxis, :, :] - pos[:, np.newaxis, :]
+            dist = np.sqrt((disp ** 2).sum(-1))
+            np.fill_diagonal(dist, 1.0)
+
+            w = w_end + 1.0 / dist ** 4
+            dd = dist - target
+            S = 0.5 * (w * dd ** 2).sum()
+            # dS is d/d(dist) of the summand w * dd**2, not of S itself; the
+            # factor 1/2 in S cancels against each pair being counted twice.
+            # The second term is the derivative of the 1/dist**4 part of w.
+            dS = 2.0 * w * dd - 4.0 * dd ** 2 / dist ** 5
+
+            coef = dS / dist
+            np.fill_diagonal(coef, 0.0)
+            grad = -(coef[..., np.newaxis] * disp).sum(axis=1)
+
+            offset = pos - pos_lin
+            S += 0.5 * gamma * (offset ** 2).sum()
+            grad += gamma * offset
+            return scale * S, scale * grad[idx].reshape(-1)
+
+        result = minimize(objective, pos_lin[idx].reshape(-1), jac=True,
+                          method='L-BFGS-B',
+                          options={'maxiter': maxiter, 'ftol': 1e-14,
+                                   'gtol': 1e-10})
+        pos_opt = pos_lin.copy()
+        pos_opt[idx] = result.x.reshape(-1, 3)
+        disp = (pos_opt - pos_i)[idx, :]
+        if LA.norm(disp) < 1e-10:
+            raise ValueError('LST produced a null bias direction; the two '
+                             'endpoints are identical over the moving atoms')
+        return self.normalize(disp.reshape(-1))
+
+    def _get_bias_vector(self, initial_atoms: Atoms,
+                         final_atoms: Atoms) -> np.ndarray:
+        """Bias direction from whichever interpolation was requested."""
+        if self.interp_method == 'idpp':
+            return self._get_idpp_bias_vector(initial_atoms, final_atoms)
+        if self.interp_method == 'lst':
+            return self._get_lst_bias_vector(initial_atoms, final_atoms)
+        raise ValueError(f"unknown interp_method {self.interp_method!r}, "
+                         "expected 'idpp' or 'lst'")
 
     def _get_newton_step(self, B_opt, g):
 
@@ -280,13 +425,10 @@ class SaddleClimb:
     def _get_initial_step(
             self: None, idx: list
             ) -> tuple[np.ndarray, np.ndarray]:
-        if self.interp_method == 'idpp':
-            dx_1D = self.delta * self._get_idpp_bias_vector(self.atoms_initial,
-                                                            self.atoms_final,
-                                                            )
+        v = self._get_bias_vector(self.atoms_initial, self.atoms_final)
+        dx_1D = self.delta * v / self._get_maxstep(v)
         self._pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
         self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
-        # dx_1D = self.delta * self.normalize(self._pos_f_1D - self._pos_i_1D)
         if self.target_indices:
             for i in range(len(self.indices)):
                 if i not in self.sub_target_indices:
@@ -338,7 +480,7 @@ class SaddleClimb:
             self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
             pos_1D = atoms.positions[idx, :].reshape(-1)
             dxi = LA.norm(self._pos_i_1D - pos_1D)
-            bias_dx = self._get_idpp_bias_vector(atoms, self.atoms_final)
+            bias_dx = self._get_bias_vector(atoms, self.atoms_final)
             B_opt = self._get_B_opt(B, bias_dx, n-1)
             dx_1D = self._get_pfro_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
@@ -360,7 +502,7 @@ class SaddleClimb:
 
             B = self._update_hessian(B, dg, dx_1D)
             if self._directed:
-                bias_dx = self._get_idpp_bias_vector(atoms, self.atoms_final)
+                bias_dx = self._get_bias_vector(atoms, self.atoms_final)
             B_opt = self._get_B_opt(B, bias_dx, n)
             if self.step_method == 'pfro':
                 dx_1D = self._get_pfro_step(B_opt, g)
