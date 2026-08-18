@@ -5,9 +5,12 @@ import numpy.linalg as LA
 from numpy import matmul as mult
 from ase.atoms import Atoms
 from ase.calculators.calculator import Calculator
+from ase.data import covalent_radii
+from ase.geometry import get_distances
+from ase.geometry import find_mic
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io.trajectory import Trajectory
-from scipy.optimize import brentq, minimize
+from scipy.optimize import minimize, brentq
 from pathlib import Path
 import copy
 from ase.mep.neb import idpp_interpolate, NEB
@@ -119,140 +122,76 @@ class SaddleClimb:
         bias_vector = self.normalize(disp.reshape(-1))
         return bias_vector
 
-    def _get_lst_bias_vector(
-            self,
-            initial_atoms: Atoms,
-            final_atoms: Atoms,
-            fraction: float = 0.001,
-            gamma: float = 1e-6,
-            maxiter: int = 500,
-            ) -> np.ndarray:
-        """
-        Linear synchronous transit bias direction.
+    def _get_lst_bias_vector(self, initial_atoms, final_atoms, f=0.01):
+        num_atoms = len(initial_atoms)
+        cell = initial_atoms.get_cell()
+        pbc = initial_atoms.get_pbc()
 
-        A single intermediate configuration is placed at ``fraction`` along
-        the path -- kappa/p of Eq. (2), taken as a continuous parameter
-        since one image is wanted rather than a whole chain -- by
-        interpolating every pair distance linearly,
+        pos_A = initial_atoms.get_positions()
+        pos_B = final_atoms.get_positions()
 
-            t_ij = d_ij(initial) + fraction * (d_ij(final) - d_ij(initial)),
+        # 1. Unwrap final coordinates relative to initial coordinates
+        disp_B_relative_to_A = pos_B - pos_A
+        disp_B_mic, _ = find_mic(disp_B_relative_to_A, cell=cell, pbc=pbc)
+        pos_B_unwrapped = pos_A + disp_B_mic
+        initial_guess = (1 - f) * pos_A + f * pos_B_unwrapped
 
-        and the Cartesian coordinates that best reproduce those targets are
-        found by minimising the objective of Halgren and Lipscomb,
-        Chem. Phys. Lett. 49, 225 (1977), Eq. (5),
+        # 2. Compute minimum image distance matrices
+        dist_matrix_A = initial_atoms.get_all_distances(mic=True)
+        dist_matrix_B = final_atoms.get_all_distances(mic=True)
 
-            S(r) = 1/2 sum_(i!=j) w_ij (d_ij(r) - t_ij)^2
-                   + gamma/2 sum_i |r_i - r_lin,i|^2 .
+        # 3. Identify pairs < 2.0 Å (restricts to adsorbate/covalent bonds)
+        pairs = []
+        r_A_list, r_B_list, r_i_list = [], [], []
+        for i in range(num_atoms):
+            for j in range(i + 1, num_atoms):
+                r_a = dist_matrix_A[i, j]
+                r_b = dist_matrix_B[i, j]
+                if r_a < 3.0 or r_b < 3.0:
+                    r_i = (1 - f) * r_a + f * r_b
+                    pairs.append((i, j))
+                    r_A_list.append(r_a)
+                    r_B_list.append(r_b)
+                    r_i_list.append(r_i)
 
-        The weight is
+        # Fallback if no pairs meet the criterion
+        if not pairs:
+            delta_pos = initial_guess - pos_A
+            disp, _ = find_mic(delta_pos[self.indices, :], cell=cell, pbc=pbc)
+            return self.normalize(disp.reshape(-1))
 
-            w_ij = 1/d_ij(initial)^4 + 1/d_ij(final)^4 + 1/d_ij(r)^4 ,
+        pairs = np.array(pairs)
+        r_i_arr = np.array(r_i_list)
+        r_A_arr = np.array(r_A_list)
+        r_B_arr = np.array(r_B_list)
+        weights = np.minimum(r_A_arr, np.minimum(r_B_arr, r_i_arr))
 
-        which differs from the 1/d^4 of the IDPP objective in counting both
-        endpoints as well as the current distance.  A pair that is long now
-        but short in the final state -- a bond that has to form -- is
-        weighted as the bond it becomes rather than as the long contact it
-        currently is, which is otherwise suppressed by a factor
-        (d_long / d_bond)^4.  Retaining the current distance is the reason
-        IDPP uses 1/d^4 in the first place: a pair that becomes short during
-        the optimisation is still driven apart.
+        # 4. Distance-based objective function
+        def objective(flat_positions):
+            coords = flat_positions.reshape((num_atoms, 3))
+            disp_vectors = coords[pairs[:, 0]] - coords[pairs[:, 1]]
+            disp_mic, _ = find_mic(disp_vectors, cell=cell, pbc=pbc)
+            r_calc = np.linalg.norm(disp_mic, axis=1)
+            loss = np.sum((1.0 / (weights**4)) * (r_calc - r_i_arr)**2)
+            return loss
 
-        The sum is a smooth stand-in for 1/min(d1, df, d)^4: it agrees
-        wherever one of the three dominates and exceeds it by at most a
-        factor of three when they coincide, while avoiding the discontinuous
-        derivative that min() introduces wherever two of the distances
-        cross.
+        # 5. Optimize
+        result = minimize(objective, initial_guess.flatten(), method='BFGS')
+        optimized_positions = result.x.reshape((num_atoms, 3))
 
-        The gamma term is the chord restraint of Eq. (5), which removes
-        uniform translation and keeps the result attached to the linear
-        path.  Halgren and Lipscomb use 1e-6 a.u.; since the weighted pair
-        term has units of length^-2, gamma has units of length^-4 and the
-        published value converts as 1e-6 bohr^-4 = 1.27e-5 A^-4, doubled
-        here to 2.5e-5 because the anchor above carries a factor 1/2 that
-        Eq. (5) does not.
+        # 6. Remove overall center-of-mass translation drift
+        drift = np.mean(optimized_positions - pos_A, axis=0)
+        optimized_positions -= drift
 
-        Because the minimisation starts from the linear interpolation, this
-        term is nearly inert at that magnitude -- gamma = 0 and gamma =
-        2.5e-5 give indistinguishable directions on every case tested.  It
-        matters only if the search is started somewhere else, such as at the
-        initial state itself, where the pair term alone has almost no
-        gradient for a near-isometric rearrangement (a rigid rotation, or a
-        hop in which every d_ij(initial) is close to d_ij(final)) and the
-        starting point is no longer supplying the direction.
+        # 7. Compute true periodic displacements directly without position wrapping
+        delta_pos = optimized_positions - pos_A
+        delta_pos_mic, _ = find_mic(delta_pos, cell=cell, pbc=pbc)
 
-        The default ``fraction`` is small because the result wanted here is
-        a direction rather than a path: the returned vector converges to a
-        differential displacement as fraction -> 0, and is stable to about
-        0.03 degrees between 1e-3 and 1e-7.  Larger values tilt towards the
-        chord -- at 0.5 the direction has already moved 16 to 28 degrees off
-        that limit.
-
-        Only ``self.indices`` are optimised, every other atom being held at
-        its initial position, so constrained atoms cannot drift.  Distances
-        are raw Cartesian distances, matching the convention used by
-        ``_get_idpp_bias_vector``; a reaction in which an atom crosses a
-        periodic boundary needs endpoints in a consistent unwrapped frame.
-        """
-        pos_i = initial_atoms.get_positions()
-        pos_f = final_atoms.get_positions()
-        d_i = initial_atoms.get_all_distances(mic=False)
-        d_f = final_atoms.get_all_distances(mic=False)
-
-        target = d_i + fraction * (d_f - d_i)
-        with np.errstate(divide='ignore'):
-            w_end = 1.0 / d_i ** 4 + 1.0 / d_f ** 4
-        # the diagonal is excluded by making every self term contribute zero
-        np.fill_diagonal(target, 1.0)
-        np.fill_diagonal(w_end, 0.0)
-
-        pos_lin = pos_i + fraction * (pos_f - pos_i)
-        idx = np.asarray(self.indices, dtype=int)
-        if fraction <= 0.0:
-            raise ValueError('fraction must be positive')
-        # S is quadratic in fraction, and the relative-reduction test in
-        # L-BFGS-B divides by max(|S|, 1), so it silently degrades into an
-        # absolute test once S falls below one and the search stops early --
-        # at fraction=1e-6 after three iterations.  Scaling S to O(1) keeps
-        # the tolerances meaningful; it multiplies both terms alike, so the
-        # balance against gamma is untouched.
-        scale = 1.0 / fraction ** 2
-
-        def objective(x):
-            pos = pos_lin.copy()
-            pos[idx] = x.reshape(-1, 3)
-            # disp[i, j] = r_j - r_i
-            disp = pos[np.newaxis, :, :] - pos[:, np.newaxis, :]
-            dist = np.sqrt((disp ** 2).sum(-1))
-            np.fill_diagonal(dist, 1.0)
-
-            w = w_end + 1.0 / dist ** 4
-            dd = dist - target
-            S = 0.5 * (w * dd ** 2).sum()
-            # dS is d/d(dist) of the summand w * dd**2, not of S itself; the
-            # factor 1/2 in S cancels against each pair being counted twice.
-            # The second term is the derivative of the 1/dist**4 part of w.
-            dS = 2.0 * w * dd - 4.0 * dd ** 2 / dist ** 5
-
-            coef = dS / dist
-            np.fill_diagonal(coef, 0.0)
-            grad = -(coef[..., np.newaxis] * disp).sum(axis=1)
-
-            offset = pos - pos_lin
-            S += 0.5 * gamma * (offset ** 2).sum()
-            grad += gamma * offset
-            return scale * S, scale * grad[idx].reshape(-1)
-
-        result = minimize(objective, pos_lin[idx].reshape(-1), jac=True,
-                          method='L-BFGS-B',
-                          options={'maxiter': maxiter, 'ftol': 1e-14,
-                                   'gtol': 1e-10})
-        pos_opt = pos_lin.copy()
-        pos_opt[idx] = result.x.reshape(-1, 3)
-        disp = (pos_opt - pos_i)[idx, :]
-        if LA.norm(disp) < 1e-10:
-            raise ValueError('LST produced a null bias direction; the two '
-                             'endpoints are identical over the moving atoms')
-        return self.normalize(disp.reshape(-1))
+        # Extract active atom displacements and normalize
+        disp = delta_pos_mic[self.indices, :].copy()
+        bias_vector = self.normalize(disp.reshape(-1))
+        
+        return bias_vector
 
     def _get_bias_vector(self, initial_atoms: Atoms,
                          final_atoms: Atoms) -> np.ndarray:
