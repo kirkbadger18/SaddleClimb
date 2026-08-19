@@ -166,7 +166,7 @@ class SaddleClimb:
 
         # target distances, and weights set by the shorter of the two ends
         r_target = (1 - f) * r_R + f * r_P
-        #r_short = np.minimum(r_R, r_P)
+        # r_short = np.minimum(r_R, r_P)
         r_short = r_R
         pairs = np.triu(np.ones_like(r_target, dtype=bool), k=1)
         fit = np.isin(initial_atoms.get_chemical_symbols(),
@@ -218,22 +218,18 @@ class SaddleClimb:
         r_ab(final) - r_ab(current): the two atoms are pushed apart if the
         bond lengthens and together if it shortens.  No pair is excluded, by
         element or by distance -- a bond already at its final length carries
-        a change of zero and so contributes nothing on its own, which is why
-        no cutoff or tolerance is needed.  Keeping the distant pairs also
-        keeps some record of lateral translation, which the short bonds
-        alone cannot see.
+        a change of zero and so contributes nothing on its own.  Keeping the
+        distant pairs also keeps some record of lateral translation, which
+        the short bonds alone cannot see.
 
-        A bond does not split its change evenly between its two atoms.  It
-        is divided in proportion to how far each atom itself has to travel
-        between the current and final structures, so a bond between a
-        migrating adsorbate atom and a nearly stationary surface atom is
-        taken up almost entirely by the adsorbate, and substrate atoms are
-        not dragged around to satisfy bonds they are not responsible for.
-
-        The contributions are then simply summed, so an atom pulled by
-        several changing bonds ends up moving along their resultant and
-        nothing constrains the total displacement.  The overall scale is
-        immaterial because the result is normalized.
+        The sum over an atom's bonds fixes only the *direction* it is pulled.
+        How far it is pulled is then set separately, atom by atom, to be
+        proportional to the distance that atom covers between the two path
+        endpoints.  An atom that hardly goes anywhere over the reaction is
+        therefore hardly steered, however loudly its bonds happen to be
+        arguing, and the substrate falls away on its own without a threshold
+        to exclude it.  The overall scale is immaterial because the result
+        is normalized.
 
         Unlike LST there is no fit, so nothing here tries to reach the final
         structure -- it only answers which way the changing bonds pull the
@@ -245,23 +241,22 @@ class SaddleClimb:
         r_R = LA.norm(pos_R[:, None, :] - pos_R[None, :, :], axis=-1)
         r_P = LA.norm(pos_P[:, None, :] - pos_P[None, :, :], axis=-1)
 
-        # each atom's own journey sets its share of the bonds it is in;
-        # share[a, b] + share[b, a] = 1, and a stationary atom takes none
-        travel = LA.norm(pos_P - pos_R, axis=1)
-        total = travel[:, None] + travel[None, :]
-        share = np.where(total > 0, travel[:, None] / np.where(
-            total > 0, total, 1), 0.5)
-
         pairs = ~np.eye(len(r_R), dtype=bool)
-        amplitude = np.where(pairs, share * (r_P - r_R), 0)
+        amplitude = np.where(pairs, r_P - r_R, 0)
         along = (pos_R[:, None, :] - pos_R[None, :, :]) / np.where(
             r_R > 0, r_R, 1)[:, :, None]
         disp = np.einsum('ab,abk->ak', amplitude, along)
 
+        # direction from the bonds, distance from the atom's own journey
+        pull = LA.norm(disp, axis=1)
+        travel = LA.norm(self.atoms_final.positions
+                         - self.atoms_initial.positions, axis=1)
+        disp = disp / np.where(pull > 0, pull, 1)[:, None] * travel[:, None]
+
         disp = disp[self.indices, :]
         if LA.norm(disp) < 1e-10:
-            raise ValueError('every bond is already at its final length; '
-                             'the bias direction is undefined')
+            raise ValueError('no atom moves between the endpoints; the bias '
+                             'direction is undefined')
         bias_vector = self.normalize(disp.reshape(-1))
         return bias_vector
 
