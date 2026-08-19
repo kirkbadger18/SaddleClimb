@@ -210,17 +210,18 @@ class SaddleClimb:
         bias_vector = self.normalize(disp.reshape(-1))
         return bias_vector
 
-    def _get_bond_bias_vector(self, initial_atoms, final_atoms,
-                              bond_elements=('C', 'H', 'N', 'O')):
+    def _get_bond_bias_vector(self, initial_atoms, final_atoms):
         """Bias direction built directly from the bonds that change.
 
-        Every pair of ``bond_elements`` atoms contributes the cartesian
-        vector along that bond, scaled by how far the bond still has to go,
+        Every pair of atoms contributes the cartesian vector along that
+        bond, scaled by how far the bond still has to go,
         r_ab(final) - r_ab(current): the two atoms are pushed apart if the
-        bond lengthens and together if it shortens.  Within that set no pair
-        is excluded by distance -- a bond already at its final length
-        carries a change of zero and so contributes nothing on its own,
-        which is why no cutoff or tolerance is needed.
+        bond lengthens and together if it shortens.  No pair is excluded, by
+        element or by distance -- a bond already at its final length carries
+        a change of zero and so contributes nothing on its own, which is why
+        no cutoff or tolerance is needed.  Keeping the distant pairs also
+        keeps some record of lateral translation, which the short bonds
+        alone cannot see.
 
         A bond does not split its change evenly between its two atoms.  It
         is divided in proportion to how far each atom itself has to travel
@@ -252,10 +253,6 @@ class SaddleClimb:
             total > 0, total, 1), 0.5)
 
         pairs = ~np.eye(len(r_R), dtype=bool)
-        bonded = np.isin(initial_atoms.get_chemical_symbols(),
-                         list(bond_elements))
-        if bonded.sum() > 1:
-            pairs &= bonded[:, None] & bonded[None, :]
         amplitude = np.where(pairs, share * (r_P - r_R), 0)
         along = (pos_R[:, None, :] - pos_R[None, :, :]) / np.where(
             r_R > 0, r_R, 1)[:, :, None]
