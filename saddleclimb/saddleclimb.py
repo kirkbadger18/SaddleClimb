@@ -6,6 +6,7 @@ from numpy import matmul as mult
 from ase.atoms import Atoms
 from ase.calculators.calculator import Calculator
 from ase.data import covalent_radii
+from ase.units import Bohr
 from ase.geometry import get_distances
 from ase.geometry import find_mic
 from ase.calculators.singlepoint import SinglePointCalculator
@@ -24,7 +25,7 @@ class SaddleClimb:
             atoms_final: Atoms,
             calculator: Calculator,
             step_method: str = 'pfro',
-            interp_method: str = 'lst',
+            interp_method: str = 'bond',
             min_directed_steps: int = 5,
             target_indices: list = None,
             fmax: float = 0.01,
@@ -122,75 +123,136 @@ class SaddleClimb:
         bias_vector = self.normalize(disp.reshape(-1))
         return bias_vector
 
-    def _get_lst_bias_vector(self, initial_atoms, final_atoms, f=0.01):
-        num_atoms = len(initial_atoms)
-        cell = initial_atoms.get_cell()
-        pbc = initial_atoms.get_pbc()
+    def _get_lst_bias_vector(self, initial_atoms, final_atoms, f=0.01,
+                             lst_elements=('C', 'H', 'N', 'O'),
+                             cutoff=2):
+        """Bias direction from the linear synchronous transit path.
 
-        pos_A = initial_atoms.get_positions()
-        pos_B = final_atoms.get_positions()
+        Follows Halgren and Lipscomb, Chem. Phys. Lett. 49 (1977) 225.
+        The LST structure at interpolation parameter ``f`` is the one whose
+        interatomic distances best match the linearly interpolated distances
+        r_ab(i) = (1-f) r_ab(R) + f r_ab(P), found by minimizing
 
-        # 1. Unwrap final coordinates relative to initial coordinates
-        disp_B_relative_to_A = pos_B - pos_A
-        disp_B_mic, _ = find_mic(disp_B_relative_to_A, cell=cell, pbc=pbc)
-        pos_B_unwrapped = pos_A + disp_B_mic
-        initial_guess = (1 - f) * pos_A + f * pos_B_unwrapped
+            S = sum_{a>b} [r_ab(c) - r_ab(i)]^2 / r_ab(i)^4
+                + 1e-6 sum_a |x_a(c) - x_a(i)|^2
 
-        # 2. Compute minimum image distance matrices
-        dist_matrix_A = initial_atoms.get_all_distances(mic=True)
-        dist_matrix_B = final_atoms.get_all_distances(mic=True)
+        with all quantities in atomic units.  The weight is taken as
+        1/min(r_ab(R), r_ab(P))^4 rather than the paper's 1/r_ab(i)^4, so a
+        pair that is bonded at either end of the path keeps a large weight
+        for every f.  A forming bond is therefore reproduced as closely as a
+        breaking one, instead of being ignored until late in the path.
 
-        # 3. Identify pairs < 2.0 Å (restricts to adsorbate/covalent bonds)
-        pairs = []
-        r_A_list, r_B_list, r_i_list = [], [], []
-        for i in range(num_atoms):
-            for j in range(i + 1, num_atoms):
-                r_a = dist_matrix_A[i, j]
-                r_b = dist_matrix_B[i, j]
-                if r_a < 3.0 or r_b < 3.0:
-                    r_i = (1 - f) * r_a + f * r_b
-                    pairs.append((i, j))
-                    r_A_list.append(r_a)
-                    r_B_list.append(r_b)
-                    r_i_list.append(r_i)
+        The reference x_a(i) of the second term is ``initial_atoms`` itself,
+        not the linearly interpolated coordinates the paper uses.  The fit is
+        underdetermined once the distance sum is restricted, so that term is
+        what fixes the leftover degrees of freedom: referencing the straight
+        line makes every unconstrained coordinate drift along it, while
+        referencing the current image asks instead for the smallest move that
+        reproduces the target distances.  Only the moving atoms are varied.
 
-        # Fallback if no pairs meet the criterion
-        if not pairs:
-            delta_pos = initial_guess - pos_A
-            disp, _ = find_mic(delta_pos[self.indices, :], cell=cell, pbc=pbc)
-            return self.normalize(disp.reshape(-1))
+        The distance sum is restricted to pairs in which *both* atoms are of
+        an element in ``lst_elements`` and which are closer than ``cutoff``
+        (in Angstrom) at one end of the path or the other, so the fit is
+        driven by the bonds that make and break rather than by the substrate
+        or by distant contacts.  Only the resulting direction is used, so
+        the structure is not meant to reproduce the final geometry
+        faithfully.
+        """
 
-        pairs = np.array(pairs)
-        r_i_arr = np.array(r_i_list)
-        r_A_arr = np.array(r_A_list)
-        r_B_arr = np.array(r_B_list)
-        weights = np.minimum(r_A_arr, np.minimum(r_B_arr, r_i_arr))
+        pos_R = initial_atoms.get_positions() / Bohr
+        pos_P = final_atoms.get_positions() / Bohr
+        r_R = LA.norm(pos_R[:, None, :] - pos_R[None, :, :], axis=-1)
+        r_P = LA.norm(pos_P[:, None, :] - pos_P[None, :, :], axis=-1)
 
-        # 4. Distance-based objective function
-        def objective(flat_positions):
-            coords = flat_positions.reshape((num_atoms, 3))
-            disp_vectors = coords[pairs[:, 0]] - coords[pairs[:, 1]]
-            disp_mic, _ = find_mic(disp_vectors, cell=cell, pbc=pbc)
-            r_calc = np.linalg.norm(disp_mic, axis=1)
-            loss = np.sum((1.0 / (weights**4)) * (r_calc - r_i_arr)**2)
-            return loss
+        # target distances, and weights set by the shorter of the two ends
+        r_target = (1 - f) * r_R + f * r_P
+        #r_short = np.minimum(r_R, r_P)
+        r_short = r_R
+        pairs = np.triu(np.ones_like(r_target, dtype=bool), k=1)
+        fit = np.isin(initial_atoms.get_chemical_symbols(),
+                      list(lst_elements))
+        if fit.sum() > 1:
+            pairs &= fit[:, None] & fit[None, :]
+        bonded = pairs & (r_short < cutoff / Bohr)
+        if bonded.any():
+            pairs = bonded
+        weights = np.where(pairs, 1 / np.where(pairs, r_short, 1) ** 4, 0)
 
-        # 5. Optimize
-        result = minimize(objective, initial_guess.flatten(), method='BFGS')
-        optimized_positions = result.x.reshape((num_atoms, 3))
+        # start from, and stay close to, the structure we are stepping away
+        # from rather than a point on the straight line to the product
+        pos_ref = pos_R
+        idx = self.indices
 
-        # 6. Remove overall center-of-mass translation drift
-        drift = np.mean(optimized_positions - pos_A, axis=0)
-        optimized_positions -= drift
+        def build(x):
+            pos = pos_ref.copy()
+            pos[idx, :] = x.reshape(-1, 3)
+            return pos
 
-        # 7. Compute true periodic displacements directly without position wrapping
-        delta_pos = optimized_positions - pos_A
-        delta_pos_mic, _ = find_mic(delta_pos, cell=cell, pbc=pbc)
+        def S_and_grad(x):
+            pos = build(x)
+            diff = pos[:, None, :] - pos[None, :, :]
+            r = LA.norm(diff, axis=-1)
+            resid = np.where(pairs, r - r_target, 0)
+            S = np.sum(weights * resid ** 2)
+            # d/dx_a of the distance terms, summed over partners b
+            coeff = 2 * weights * resid / np.where(r > 0, r, 1)
+            coeff = coeff + coeff.T
+            grad = np.einsum('ab,abk->ak', coeff, diff)
+            # weak harmonic anchor to the reference structure
+            dx = pos - pos_ref
+            S += 1e-6 * np.sum(dx ** 2)
+            grad += 2e-6 * dx
+            return S, grad[idx, :].reshape(-1)
 
-        # Extract active atom displacements and normalize
-        disp = delta_pos_mic[self.indices, :].copy()
+        result = minimize(S_and_grad, pos_ref[idx, :].reshape(-1),
+                          jac=True, method='L-BFGS-B')
+        disp = result.x.reshape(-1, 3) - pos_R[idx, :]
         bias_vector = self.normalize(disp.reshape(-1))
-        
+        return bias_vector
+
+    def _get_bond_bias_vector(self, initial_atoms, final_atoms, tol=0.1,
+                              bond_elements=('C', 'H', 'N', 'O'),
+                              cutoff=3):
+        """Bias direction built directly from the bonds that change most.
+
+        Every pair that is bonded at one end of the path or the other, and
+        whose length changes by more than ``tol`` Angstrom, contributes the
+        cartesian vector along that bond: the two atoms are pushed apart if
+        the bond lengthens and together if it shortens, by an amount
+        proportional to the change.  The contributions are simply summed,
+        so an atom pulled by several changing bonds ends up moving along
+        their resultant and nothing constrains the total displacement.  The
+        overall scale is immaterial because the result is normalized.
+
+        Unlike LST there is no fit, so nothing here tries to reach the final
+        structure -- it only answers which way the changing bonds pull the
+        atoms right now.
+        """
+
+        pos_R = initial_atoms.get_positions()
+        pos_P = final_atoms.get_positions()
+        r_R = LA.norm(pos_R[:, None, :] - pos_R[None, :, :], axis=-1)
+        r_P = LA.norm(pos_P[:, None, :] - pos_P[None, :, :], axis=-1)
+
+        change = r_P - r_R
+        pairs = np.triu(np.ones_like(r_R, dtype=bool), k=1)
+        bonded = np.isin(initial_atoms.get_chemical_symbols(),
+                         list(bond_elements))
+        if bonded.sum() > 1:
+            pairs &= bonded[:, None] & bonded[None, :]
+        pairs &= np.minimum(r_R, r_P) < cutoff
+        pairs &= np.abs(change) > tol
+        if not pairs.any():
+            raise ValueError('no bond changes by more than tol; lower tol '
+                             'or raise cutoff')
+
+        disp = np.zeros_like(pos_R)
+        for a, b in zip(*np.where(pairs)):
+            along = (pos_R[a] - pos_R[b]) / r_R[a, b]
+            disp[a] += 0.5 * change[a, b] * along
+            disp[b] -= 0.5 * change[a, b] * along
+
+        bias_vector = self.normalize(disp[self.indices, :].reshape(-1))
         return bias_vector
 
     def _get_bias_vector(self, initial_atoms: Atoms,
@@ -200,8 +262,10 @@ class SaddleClimb:
             return self._get_idpp_bias_vector(initial_atoms, final_atoms)
         if self.interp_method == 'lst':
             return self._get_lst_bias_vector(initial_atoms, final_atoms)
+        if self.interp_method == 'bond':
+            return self._get_bond_bias_vector(initial_atoms, final_atoms)
         raise ValueError(f"unknown interp_method {self.interp_method!r}, "
-                         "expected 'idpp' or 'lst'")
+                         "expected 'idpp', 'lst' or 'bond'")
 
     def _get_newton_step(self, B_opt, g):
 
