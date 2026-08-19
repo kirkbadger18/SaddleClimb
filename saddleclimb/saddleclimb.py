@@ -210,21 +210,29 @@ class SaddleClimb:
         bias_vector = self.normalize(disp.reshape(-1))
         return bias_vector
 
-    def _get_bond_bias_vector(self, initial_atoms, final_atoms):
+    def _get_bond_bias_vector(self, initial_atoms, final_atoms,
+                              bond_elements=('C', 'H', 'N', 'O')):
         """Bias direction built directly from the bonds that change.
 
-        Every pair of atoms contributes the cartesian vector along that
-        bond, scaled by how far the bond still has to go,
+        Every pair of ``bond_elements`` atoms contributes the cartesian
+        vector along that bond, scaled by how far the bond still has to go,
         r_ab(final) - r_ab(current): the two atoms are pushed apart if the
-        bond lengthens and together if it shortens.  No pair is selected or
-        excluded, by element, distance or anything else -- a bond already at
-        its final length carries a change of zero and so contributes nothing
-        on its own, which is why no cutoff or tolerance is needed.
+        bond lengthens and together if it shortens.  Within that set no pair
+        is excluded by distance -- a bond already at its final length
+        carries a change of zero and so contributes nothing on its own,
+        which is why no cutoff or tolerance is needed.
 
-        The contributions are simply summed, so an atom pulled by several
-        changing bonds ends up moving along their resultant and nothing
-        constrains the total displacement.  The overall scale is immaterial
-        because the result is normalized.
+        A bond does not split its change evenly between its two atoms.  It
+        is divided in proportion to how far each atom itself has to travel
+        between the current and final structures, so a bond between a
+        migrating adsorbate atom and a nearly stationary surface atom is
+        taken up almost entirely by the adsorbate, and substrate atoms are
+        not dragged around to satisfy bonds they are not responsible for.
+
+        The contributions are then simply summed, so an atom pulled by
+        several changing bonds ends up moving along their resultant and
+        nothing constrains the total displacement.  The overall scale is
+        immaterial because the result is normalized.
 
         Unlike LST there is no fit, so nothing here tries to reach the final
         structure -- it only answers which way the changing bonds pull the
@@ -236,11 +244,19 @@ class SaddleClimb:
         r_R = LA.norm(pos_R[:, None, :] - pos_R[None, :, :], axis=-1)
         r_P = LA.norm(pos_P[:, None, :] - pos_P[None, :, :], axis=-1)
 
-        pairs = np.triu(np.ones_like(r_R, dtype=bool), k=1)
-        # amplitude of each bond's pull, shared evenly by its two atoms and
-        # applied to both of them, so the sum runs over every pair at once
-        amplitude = np.where(pairs, 0.5 * (r_P - r_R), 0)
-        amplitude = amplitude + amplitude.T
+        # each atom's own journey sets its share of the bonds it is in;
+        # share[a, b] + share[b, a] = 1, and a stationary atom takes none
+        travel = LA.norm(pos_P - pos_R, axis=1)
+        total = travel[:, None] + travel[None, :]
+        share = np.where(total > 0, travel[:, None] / np.where(
+            total > 0, total, 1), 0.5)
+
+        pairs = ~np.eye(len(r_R), dtype=bool)
+        bonded = np.isin(initial_atoms.get_chemical_symbols(),
+                         list(bond_elements))
+        if bonded.sum() > 1:
+            pairs &= bonded[:, None] & bonded[None, :]
+        amplitude = np.where(pairs, share * (r_P - r_R), 0)
         along = (pos_R[:, None, :] - pos_R[None, :, :]) / np.where(
             r_R > 0, r_R, 1)[:, :, None]
         disp = np.einsum('ab,abk->ak', amplitude, along)
