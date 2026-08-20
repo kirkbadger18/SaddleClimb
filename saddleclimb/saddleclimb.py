@@ -25,7 +25,7 @@ class SaddleClimb:
             atoms_final: Atoms,
             calculator: Calculator,
             step_method: str = 'pfro',
-            interp_method: str = 'bond',
+            interp_method: str = 'lst',
             min_directed_steps: int = 5,
             target_indices: list = None,
             fmax: float = 0.01,
@@ -123,9 +123,7 @@ class SaddleClimb:
         bias_vector = self.normalize(disp.reshape(-1))
         return bias_vector
 
-    def _get_lst_bias_vector(self, initial_atoms, final_atoms, f=0.01,
-                             lst_elements=('C', 'H', 'N', 'O'),
-                             cutoff=2):
+    def _get_lst_bias_vector(self, initial_atoms, final_atoms, f=0.01):
         """Bias direction from the linear synchronous transit path.
 
         Follows Halgren and Lipscomb, Chem. Phys. Lett. 49 (1977) 225.
@@ -133,30 +131,71 @@ class SaddleClimb:
         interatomic distances best match the linearly interpolated distances
         r_ab(i) = (1-f) r_ab(R) + f r_ab(P), found by minimizing
 
-            S = sum_{a>b} [r_ab(c) - r_ab(i)]^2 / r_ab(i)^4
-                + 1e-6 sum_a |x_a(c) - x_a(i)|^2
+            S = sum_{a<b} w_ab [ (r_ab(c) - r_ab(i))^2
+                                 + (|dx_a| - f d_a)^2
+                                 + (|dx_b| - f d_b)^2 ]
+
+        with dx_a = x_a(c) - x_a(R) and d_a the distance atom a still has to
+        travel to reach the product.
 
         with all quantities in atomic units.  The weight is taken as
-        1/min(r_ab(R), r_ab(P))^4 rather than the paper's 1/r_ab(i)^4, so a
-        pair that is bonded at either end of the path keeps a large weight
-        for every f.  A forming bond is therefore reproduced as closely as a
-        breaking one, instead of being ignored until late in the path.
+        1/r_ab(R)^4 + 1/r_ab(P)^4 rather than the paper's 1/r_ab(i)^4, so a
+        pair counts for as much as its shorter end is short.  A bond that
+        breaks is held by the reactant term and one that forms by the
+        product term, each as heavily as the other, instead of a forming
+        bond going unnoticed until the path has already closed it.  A pair
+        that keeps its length throughout is held by both.
 
-        The reference x_a(i) of the second term is ``initial_atoms`` itself,
-        not the linearly interpolated coordinates the paper uses.  The fit is
-        underdetermined once the distance sum is restricted, so that term is
-        what fixes the leftover degrees of freedom: referencing the straight
-        line makes every unconstrained coordinate drift along it, while
-        referencing the current image asks instead for the smallest move that
-        reproduces the target distances.  Only the moving atoms are varied.
+        The second term penalises an atom for outrunning its share of the
+        journey.  At progress ``f`` atom a is due to cover about f*d_a, with
+        d_a the distance it still has to travel to reach the product, so any
+        displacement past that is charged h_a times its square, with
+        h_a = sum_b w_ab.  That is what comes of charging the displacement
+        once per bond an atom takes part in, so the pair sum reads
 
-        The distance sum is restricted to pairs in which *both* atoms are of
-        an element in ``lst_elements`` and which are closer than ``cutoff``
-        (in Angstrom) at one end of the path or the other, so the fit is
-        driven by the bonds that make and break rather than by the substrate
-        or by distant contacts.  Only the resulting direction is used, so
-        the structure is not meant to reproduce the final geometry
-        faithfully.
+            sum_{a<b} w_ab [ (r_ab - r_ab(i))^2
+                             + (|dx_a| - f d_a)^2 + (|dx_b| - f d_b)^2 ]
+
+        and every term in the fit carries the same 1/r^4 weight, with no
+        scale left to tune between the two halves.  Collecting an atom's
+        displacement terms over the bonds it takes part in gives the
+        equivalent per-atom form, weighted by h_a = sum_b w_ab.
+
+            sum_a max(0, |x_a(c) - x_a(i)| - f d_a)^2
+
+        The distance sum alone cannot say which of a pair moves to fix a
+        bond length -- weighting a pair more heavily asks that the
+        constraint be met, not that a particular atom meet it -- so a
+        near-stationary atom is otherwise free to absorb a displacement
+        many times its own share, and the bias, once normalised, hands it a
+        correspondingly large slice.  The penalty is two-sided: an atom is
+        charged for lagging behind f*d_a as much as for outrunning it, so
+        the term sets each atom's step length rather than merely capping it.
+        It cannot set a direction -- |x_a(c) - x_a(R)| has no gradient at
+        zero displacement -- so the distance sum still decides which way an
+        atom goes and this term only says how far.
+
+        Both the allowance and the displacement are measured from
+        ``initial_atoms`` itself, not from the linearly interpolated
+        coordinates the paper uses: referencing the straight line would make
+        every unconstrained coordinate drift along it, while referencing the
+        current image asks instead for the smallest move that reproduces the
+        target distances.  The paper's weak harmonic anchor is dropped -- it
+        pulled every atom back toward standing still, and the leftover
+        degrees of freedom are held well enough by starting the search at
+        the current image, where the distance sum has no gradient along
+        them.  Only the moving atoms are varied.
+
+        Every pair of *moving* atoms enters the sum -- no element list and
+        no distance cutoff.  The weight does the selecting on its own: a
+        distant pair is damped by four powers of its length, so distant
+        contacts fall away without a threshold to exclude them, and which
+        pairs matter is decided by the geometry itself rather than by a list
+        fixed in advance.  Atoms that hold still between the endpoints drop
+        out entirely, so the fit answers only how the atoms that move
+        rearrange among themselves.  Only the resulting
+        direction is used, so the structure is not meant to reproduce the
+        final geometry faithfully.
         """
 
         pos_R = initial_atoms.get_positions() / Bohr
@@ -164,19 +203,18 @@ class SaddleClimb:
         r_R = LA.norm(pos_R[:, None, :] - pos_R[None, :, :], axis=-1)
         r_P = LA.norm(pos_P[:, None, :] - pos_P[None, :, :], axis=-1)
 
-        # target distances, and weights set by the shorter of the two ends
+        # target distances, and weights set by whichever end is shorter
         r_target = (1 - f) * r_R + f * r_P
-        # r_short = np.minimum(r_R, r_P)
-        r_short = r_R
-        pairs = np.triu(np.ones_like(r_target, dtype=bool), k=1)
-        fit = np.isin(initial_atoms.get_chemical_symbols(),
-                      list(lst_elements))
-        if fit.sum() > 1:
-            pairs &= fit[:, None] & fit[None, :]
-        bonded = pairs & (r_short < cutoff / Bohr)
-        if bonded.any():
-            pairs = bonded
-        weights = np.where(pairs, 1 / np.where(pairs, r_short, 1) ** 4, 0)
+        pairs = np.zeros_like(r_target, dtype=bool)
+        pairs[np.ix_(self.indices, self.indices)] = True
+        pairs &= np.triu(np.ones_like(r_target, dtype=bool), k=1)
+        weights = np.where(pairs, 1 / np.where(pairs, r_R, 1) ** 4
+                           + 1 / np.where(pairs, r_P, 1) ** 4, 0)
+
+        # how far each atom is due to move over this fraction of the path,
+        # and how stiffly it is held there: once per bond it takes part in
+        allowance = f * LA.norm(pos_P - pos_R, axis=1)
+        hold = (weights + weights.T).sum(axis=1)
 
         # start from, and stay close to, the structure we are stepping away
         # from rather than a point on the straight line to the product
@@ -198,10 +236,13 @@ class SaddleClimb:
             coeff = 2 * weights * resid / np.where(r > 0, r, 1)
             coeff = coeff + coeff.T
             grad = np.einsum('ab,abk->ak', coeff, diff)
-            # weak harmonic anchor to the reference structure
+            # a charge for any atom that outruns its share of the path
             dx = pos - pos_ref
-            S += 1e-6 * np.sum(dx ** 2)
-            grad += 2e-6 * dx
+            step = LA.norm(dx, axis=1)
+            excess = step - allowance
+            S += np.sum(hold * excess ** 2)
+            grad += 2 * (hold * excess)[:, None] * (
+                dx / np.where(step > 0, step, 1)[:, None])
             return S, grad[idx, :].reshape(-1)
 
         result = minimize(S_and_grad, pos_ref[idx, :].reshape(-1),
@@ -224,12 +265,15 @@ class SaddleClimb:
 
         The sum over an atom's bonds fixes only the *direction* it is pulled.
         How far it is pulled is then set separately, atom by atom, to be
-        proportional to the distance that atom covers between the two path
-        endpoints.  An atom that hardly goes anywhere over the reaction is
-        therefore hardly steered, however loudly its bonds happen to be
-        arguing, and the substrate falls away on its own without a threshold
-        to exclude it.  The overall scale is immaterial because the result
-        is normalized.
+        proportional to the distance that atom has left to cover, from where
+        it stands now to where it ends up.  An atom that hardly goes anywhere
+        over the reaction is therefore hardly steered, however loudly its
+        bonds happen to be arguing, and the substrate falls away on its own
+        without a threshold to exclude it.  Measuring what is left rather
+        than the whole journey also lets an atom that has already arrived
+        stop being steered, instead of being pushed with its full starting
+        weight along whatever its residual bond mismatch happens to say.
+        The overall scale is immaterial because the result is normalized.
 
         Unlike LST there is no fit, so nothing here tries to reach the final
         structure -- it only answers which way the changing bonds pull the
@@ -247,18 +291,23 @@ class SaddleClimb:
             r_R > 0, r_R, 1)[:, :, None]
         disp = np.einsum('ab,abk->ak', amplitude, along)
 
-        # direction from the bonds, distance from the atom's own journey
+        # direction from the bonds, distance from the journey still to come
         pull = LA.norm(disp, axis=1)
-        travel = LA.norm(self.atoms_final.positions
-                         - self.atoms_initial.positions, axis=1)
+        travel = LA.norm(pos_P - pos_R, axis=1)
         disp = disp / np.where(pull > 0, pull, 1)[:, None] * travel[:, None]
 
         disp = disp[self.indices, :]
         if LA.norm(disp) < 1e-10:
-            raise ValueError('no atom moves between the endpoints; the bias '
-                             'direction is undefined')
+            raise ValueError('no atom has any distance left to cover; the '
+                             'bias direction is undefined')
         bias_vector = self.normalize(disp.reshape(-1))
         return bias_vector
+
+    def _get_linear_bias_vector(self, initial_atoms, final_atoms):
+        """Bias straight down the line from here to the product."""
+        disp = (final_atoms.get_positions()
+                - initial_atoms.get_positions())[self.indices, :]
+        return self.normalize(disp.reshape(-1))
 
     def _get_bias_vector(self, initial_atoms: Atoms,
                          final_atoms: Atoms) -> np.ndarray:
@@ -269,8 +318,10 @@ class SaddleClimb:
             return self._get_lst_bias_vector(initial_atoms, final_atoms)
         if self.interp_method == 'bond':
             return self._get_bond_bias_vector(initial_atoms, final_atoms)
+        if self.interp_method == 'linear':
+            return self._get_linear_bias_vector(initial_atoms, final_atoms)
         raise ValueError(f"unknown interp_method {self.interp_method!r}, "
-                         "expected 'idpp', 'lst' or 'bond'")
+                         "expected 'idpp', 'lst', 'bond' or 'linear'")
 
     def _get_newton_step(self, B_opt, g):
 
