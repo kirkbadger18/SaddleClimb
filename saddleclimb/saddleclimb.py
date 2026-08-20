@@ -55,7 +55,7 @@ class SaddleClimb:
         dpos = self.atoms_final.positions - self.atoms_initial.positions
         idx = []
         for i in range(dpos.shape[0]):
-            if LA.norm(dpos[i, :]) > 1e-1:
+            if LA.norm(dpos[i, :]) > 1e-6:
                 idx.append(i)
         self.indices = idx.copy()
 
