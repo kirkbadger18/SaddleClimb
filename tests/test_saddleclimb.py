@@ -141,3 +141,28 @@ def test_initialize_atoms():
     assert climber.calculator.results == atoms_test.calc.results
     assert climber.indices == idx_test
     assert_allclose(climber.hessian, B_test)
+
+
+def test_pfro_step_nulls_ascent_when_not_climbing():
+    """The guard drops the vmax component; the rest still relaxes."""
+    climber = generate_saddleclimb_object()
+    rng = np.random.default_rng(0)
+    for _ in range(5):
+        n = 12
+        Q, _ = LA.qr(rng.standard_normal((n, n)))
+        eigs = rng.uniform(0.2, 30, n)
+        eigs[0] = -eigs[0]
+        B_opt = Q @ np.diag(np.sort(eigs)) @ Q.T
+        g = rng.standard_normal(n) * 0.3
+        _, vecs = LA.eigh(B_opt)
+        vmax = vecs[:, 0]
+
+        climber._climbing = True
+        climbed = climber._get_pfro_step(B_opt, g)
+        assert abs(np.dot(climbed, vmax)) > 1e-8
+
+        climber._climbing = False
+        step = climber._get_pfro_step(B_opt, g)
+        assert_allclose(np.dot(step, vmax), 0, atol=1e-12)
+        assert np.dot(g, step) < 0
+        assert climber._get_maxstep(step) <= climber.maxstepsize + 1e-9

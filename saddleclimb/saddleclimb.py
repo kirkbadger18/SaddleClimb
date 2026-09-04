@@ -46,6 +46,7 @@ class SaddleClimb:
         self.trajfile = trajfile
         self._restart = False
         self._directed = True
+        self._climbing = True
         self._get_moving_atoms()
         if self.target_indices:
             self._get_sub_target_atoms()
@@ -66,11 +67,23 @@ class SaddleClimb:
                 sub_indices.append(i)
         self.sub_target_indices = sub_indices.copy()
 
-    def _get_B_opt(self, B, n):
+    def _get_B_opt(self, B, g, pos_1D, n):
 
+        dxi = self._pos_i_1D - pos_1D
+        dxf = self._pos_f_1D - pos_1D
         dxi_to_f = self._pos_f_1D - self._pos_i_1D
         eigs_B, vecs_B = LA.eigh(B)
-        if (eigs_B[0] > 0 or n <= self.min_directed_steps) and self._directed:
+        # The ascent direction is picked by the local gradient alone: the
+        # PRFO step along vmax carries the sign of g.vmax, and no endpoint
+        # enters the step after the first displacement.  When the energy
+        # falls toward both endpoints there is no reaction left to climb
+        # in this direction, so ascending walks out of the channel --
+        # drop the ascent component for this step and relax the rest.
+        self._climbing = not (np.dot(g, dxi) < 0 and np.dot(g, dxf) < 0)
+        if not self._climbing:
+            eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
+        elif ((eigs_B[0] > 0 or n <= self.min_directed_steps)
+                and self._directed):
             first_column = dxi_to_f.copy()
             if self.target_indices:
                 for i in range(len(self.indices)):
@@ -87,7 +100,7 @@ class SaddleClimb:
             self._directed = False
 
         for i, eig in enumerate(eigs_tmp):
-            if i == 0:
+            if i == 0 and self._climbing:
                 eigs_tmp[i] = - np.abs(eig)
             else:
                 eigs_tmp[i] = np.abs(eig)
@@ -117,6 +130,11 @@ class SaddleClimb:
         spanned by ``vmin``.  ``a`` acts as a trust radius control: the
         step tends to zero as a -> 0 and to the full Newton/RFO step as
         a -> inf.
+
+        When the guard has cleared ``_climbing`` the ``vmax`` component is
+        nulled rather than descended: climb and descent would otherwise be
+        the same mode pulling opposite ways.  What is left relaxes
+        everything perpendicular to it.
         """
         Ndim = len(g)
         climb_M = np.array([
@@ -129,7 +147,7 @@ class SaddleClimb:
         descend_M[0:Ndim-1, -1] = a*mult(g.T, vmin)
         _, svecs_min = LA.eigh(descend_M)
         _, svecs_max = LA.eigh(climb_M)
-        smax = a*svecs_max[0, 1] / svecs_max[1, 1]
+        smax = a*svecs_max[0, 1] / svecs_max[1, 1] if self._climbing else 0
         smin = (a / svecs_min[-1, 0]) * svecs_min[0:Ndim-1, 0]
         step = smax * vmax + mult(vmin, smin)
         return step
@@ -190,6 +208,14 @@ class SaddleClimb:
         if maxstep > self.maxstepsize:
             step *= self.maxstepsize / maxstep
         return step
+
+    def _get_step(self, B_opt, g):
+        """Step from the modified Hessian, by whichever method is set."""
+        if self.method == 'pfro':
+            return self._get_pfro_step(B_opt, g)
+        elif self.method == 'newton':
+            return self._get_newton_step(B_opt, g)
+        raise ValueError(f'unknown method {self.method!r}')
 
     def _update_hessian(
             self: None, B_old: np.ndarray,
@@ -314,8 +340,8 @@ class SaddleClimb:
             self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
             pos_1D = atoms.positions[idx, :].reshape(-1)
             dxi = LA.norm(self._pos_i_1D - pos_1D)
-            B_opt = self._get_B_opt(B, n-1)
-            dx_1D = self._get_pfro_step(B_opt, g)
+            B_opt = self._get_B_opt(B, g, pos_1D, n-1)
+            dx_1D = self._get_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
         else:
             atoms, idx, B = self._initialize_atoms()
@@ -334,11 +360,8 @@ class SaddleClimb:
             Fmax = LA.norm(-g.reshape(-1, 3), axis=1).max()
 
             B = self._update_hessian(B, dg, dx_1D)
-            B_opt = self._get_B_opt(B, n)
-            if self.method == 'pfro':
-                dx_1D = self._get_pfro_step(B_opt, g)
-            elif self.method == 'newton':
-                dx_1D = self._get_newton_step(B_opt, g)
+            B_opt = self._get_B_opt(B, g, pos_1D, n)
+            dx_1D = self._get_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
             n += 1
             log_string = self._get_log_string(n, E, Fmax)
