@@ -166,3 +166,98 @@ def test_pfro_step_nulls_ascent_when_not_climbing():
         assert_allclose(np.dot(step, vmax), 0, atol=1e-12)
         assert np.dot(g, step) < 0
         assert climber._get_maxstep(step) <= climber.maxstepsize + 1e-9
+
+
+def test_climb_guard_reads_ascent_direction_not_gradient():
+    """The guard tests the direction the ascent component moves.
+
+    The step along vmax carries the sign of g.vmax, so the ascent
+    direction is +/- vmax, not g.  Off the endpoint chord both endpoint
+    dots pick up a shared perpendicular term, so a gradient dominated by
+    that term -- the near-convergence case -- reads as "away from both"
+    no matter what the climb is doing.  The ascent direction does not.
+    """
+    climber = generate_saddleclimb_object()
+    idx = climber.indices
+    n = 3 * len(idx)
+    climber._pos_i_1D = climber.atoms_initial.positions[idx, :].reshape(-1)
+    climber._pos_f_1D = climber.atoms_final.positions[idx, :].reshape(-1)
+    climber._directed = False
+
+    half = (climber._pos_f_1D - climber._pos_i_1D) / 2
+    chord = climber.normalize(half)
+    basis, _ = LA.qr(chord.reshape(n, 1), mode='complete')
+    off = basis[:, 1]
+    # Sit off the chord, so both endpoints lie back along -off.
+    pos_1D = climber._pos_i_1D + half + 0.5 * off
+    dxi = climber._pos_i_1D - pos_1D
+    dxf = climber._pos_f_1D - pos_1D
+
+    def hessian_with_lowest_mode(vec):
+        vecs, _ = LA.qr(vec.reshape(n, 1), mode='complete')
+        return vecs @ np.diag(np.concatenate(([-5.0],
+                                              np.full(n - 1, 5.0)))) @ vecs.T
+
+    # Gradient dominated by +off: both endpoint dots go negative, so the
+    # gradient rule stops.  The ascent direction lies along the chord and
+    # still points at an endpoint, so the climb continues.
+    g = 0.01 * chord + 8.0 * off
+    assert np.dot(g, dxi) < 0 and np.dot(g, dxf) < 0
+    climber._get_B_opt(hessian_with_lowest_mode(chord), g, pos_1D, 50)
+    assert climber._climbing
+
+    # Converse: the gradient still points at the final endpoint, but the
+    # ascent direction is +off, which leads away from both.
+    g = 8.0 * chord + 0.01 * off
+    assert np.dot(g, dxf) > 0
+    climber._get_B_opt(hessian_with_lowest_mode(off), g, pos_1D, 50)
+    assert not climber._climbing
+
+
+def test_climb_guard_is_live_during_directed_climb():
+    """The guard applies to the biased mode as well as the free one.
+
+    While ``_directed`` holds, the QR surgery makes dhat an exact
+    eigenvector, so the ascent direction is +/- dhat.  With
+    t = dhat.(pos - pos_i) and L = dhat.(pos_f - pos_i), the endpoint
+    dots are -t and L - t, so the guard fires exactly on overshoot --
+    past the final endpoint when climbing along +dhat, behind the
+    initial one when climbing along -dhat.  Between the endpoints the
+    chord always points at one of them and the climb must continue.
+    """
+    climber = generate_saddleclimb_object()
+    idx = climber.indices
+    n = 3 * len(idx)
+    climber._pos_i_1D = climber.atoms_initial.positions[idx, :].reshape(-1)
+    climber._pos_f_1D = climber.atoms_final.positions[idx, :].reshape(-1)
+    chord = climber._pos_f_1D - climber._pos_i_1D
+    dhat = climber.normalize(chord)
+
+    # dhat distinctly lowest and B positive definite, so _get_B_opt takes
+    # the directed branch and climbs dhat itself.
+    basis, _ = LA.qr(dhat.reshape(n, 1), mode='complete')
+    eigs = np.concatenate(([1.0], np.full(n - 1, 5.0)))
+    B = basis @ np.diag(eigs) @ basis.T
+
+    def guard(frac, sign):
+        pos_1D = climber._pos_i_1D + frac * chord
+        g = sign * 0.5 * dhat + 0.02 * basis[:, 1]
+        climber._directed = True
+        B_opt = climber._get_B_opt(B, g, pos_1D, 50)
+        vmax = LA.eigh(B_opt)[1][:, 0]
+        assert_allclose(abs(np.dot(vmax, dhat)), 1.0, atol=1e-10)
+        return climber._climbing
+
+    # Between the endpoints the guard cannot fire, either orientation.
+    for frac in [0.25, 0.5, 0.9]:
+        assert guard(frac, +1)
+        assert guard(frac, -1)
+
+    # Past the final endpoint, climbing along +dhat leads away from both.
+    assert not guard(1.05, +1)
+    assert not guard(1.3, +1)
+    # Behind the initial endpoint, the same is true of -dhat.
+    assert not guard(-0.1, -1)
+    # The opposite orientation still points back at an endpoint.
+    assert guard(1.3, -1)
+    assert guard(-0.1, +1)

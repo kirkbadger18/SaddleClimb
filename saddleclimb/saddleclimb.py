@@ -50,7 +50,7 @@ class SaddleClimb:
         self._get_moving_atoms()
         if self.target_indices:
             self._get_sub_target_atoms()
-        self.hessian = 100 * np.eye(3*len(self.indices))
+        self.hessian = 70 * np.eye(3*len(self.indices))
 
     def _get_moving_atoms(self):
         dpos = self.atoms_final.positions - self.atoms_initial.positions
@@ -73,17 +73,9 @@ class SaddleClimb:
         dxf = self._pos_f_1D - pos_1D
         dxi_to_f = self._pos_f_1D - self._pos_i_1D
         eigs_B, vecs_B = LA.eigh(B)
-        # The ascent direction is picked by the local gradient alone: the
-        # PRFO step along vmax carries the sign of g.vmax, and no endpoint
-        # enters the step after the first displacement.  When the energy
-        # falls toward both endpoints there is no reaction left to climb
-        # in this direction, so ascending walks out of the channel --
-        # drop the ascent component for this step and relax the rest.
-        self._climbing = not (np.dot(g, dxi) < 0 and np.dot(g, dxf) < 0)
-        if not self._climbing:
-            eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
-        elif ((eigs_B[0] > 0 or n <= self.min_directed_steps)
-                and self._directed):
+        directed = ((eigs_B[0] > 0 or n <= self.min_directed_steps)
+                    and self._directed)
+        if directed:
             first_column = dxi_to_f.copy()
             if self.target_indices:
                 for i in range(len(self.indices)):
@@ -97,6 +89,26 @@ class SaddleClimb:
             eigs_tmp, vecs_tmp = LA.eigh(B_new)
         else:
             eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
+
+        # Guard the direction the step would actually ascend rather than
+        # the gradient.  vmax is the mode PRFO climbs and the sign of
+        # g.vmax fixes which of +/- vmax is uphill, so ascent_dir is the
+        # displacement the smax component contributes.  Climbing only
+        # makes sense while that displacement still heads toward one of
+        # the endpoints; when it leads away from both there is no
+        # reaction left to climb here, so drop the ascent component for
+        # this step and relax the rest.  The gradient answers the same
+        # question only far from a stationary point -- near an FOSP it
+        # vanishes and its endpoint dots turn on noise, which reads as a
+        # spurious descent.  The ascent direction stays well defined
+        # there.
+        vmax = vecs_tmp[:, 0]
+        ascent_dir = vmax if np.dot(g, vmax) > 0 else -vmax
+        self._climbing = not (np.dot(ascent_dir, dxi) < 0
+                              and np.dot(ascent_dir, dxf) < 0)
+        if not self._climbing:
+            eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
+        elif not directed:
             self._directed = False
 
         for i, eig in enumerate(eigs_tmp):
