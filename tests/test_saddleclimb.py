@@ -203,14 +203,14 @@ def test_climb_guard_reads_ascent_direction_not_gradient():
     # still points at an endpoint, so the climb continues.
     g = 0.01 * chord + 8.0 * off
     assert np.dot(g, dxi) < 0 and np.dot(g, dxf) < 0
-    climber._get_B_opt(hessian_with_lowest_mode(chord), g, pos_1D, 50)
+    climber._get_B_opt(hessian_with_lowest_mode(chord), g, pos_1D)
     assert climber._climbing
 
     # Converse: the gradient still points at the final endpoint, but the
     # ascent direction is +off, which leads away from both.
     g = 8.0 * chord + 0.01 * off
     assert np.dot(g, dxf) > 0
-    climber._get_B_opt(hessian_with_lowest_mode(off), g, pos_1D, 50)
+    climber._get_B_opt(hessian_with_lowest_mode(off), g, pos_1D)
     assert not climber._climbing
 
 
@@ -243,7 +243,7 @@ def test_climb_guard_is_live_during_directed_climb():
         pos_1D = climber._pos_i_1D + frac * chord
         g = sign * 0.5 * dhat + 0.02 * basis[:, 1]
         climber._directed = True
-        B_opt = climber._get_B_opt(B, g, pos_1D, 50)
+        B_opt = climber._get_B_opt(B, g, pos_1D)
         vmax = LA.eigh(B_opt)[1][:, 0]
         assert_allclose(abs(np.dot(vmax, dhat)), 1.0, atol=1e-10)
         return climber._climbing
