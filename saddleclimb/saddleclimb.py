@@ -20,7 +20,7 @@ class SaddleClimb:
             atoms_final: Atoms,
             calculator: Calculator,
             method: str = 'pfro',
-            min_directed_steps: int = 5,
+            unlatch_persist: int = 3,
             target_indices: list = None,
             fmax: float = 0.01,
             maxstepsize: float = 0.2,
@@ -36,7 +36,7 @@ class SaddleClimb:
         self.target_indices = target_indices
         self.calculator = calculator
         self.method = method
-        self.min_directed_steps = min_directed_steps
+        self.unlatch_persist = unlatch_persist
         self.fmax = fmax
         self.maxstepsize = maxstepsize
         self.a_max = a_max
@@ -46,11 +46,12 @@ class SaddleClimb:
         self.trajfile = trajfile
         self._restart = False
         self._directed = True
+        self._unlatch_streak = 0
         self._climbing = True
         self._get_moving_atoms()
         if self.target_indices:
             self._get_sub_target_atoms()
-        self.hessian = 100 * np.eye(3*len(self.indices))
+        self.hessian = 70 * np.eye(3*len(self.indices))
 
     def _get_moving_atoms(self):
         dpos = self.atoms_final.positions - self.atoms_initial.positions
@@ -67,23 +68,19 @@ class SaddleClimb:
                 sub_indices.append(i)
         self.sub_target_indices = sub_indices.copy()
 
-    def _get_B_opt(self, B, g, pos_1D, n):
+    def _get_B_opt(self, B, g, pos_1D):
 
         dxi = self._pos_i_1D - pos_1D
         dxf = self._pos_f_1D - pos_1D
         dxi_to_f = self._pos_f_1D - self._pos_i_1D
         eigs_B, vecs_B = LA.eigh(B)
-        # The ascent direction is picked by the local gradient alone: the
-        # PRFO step along vmax carries the sign of g.vmax, and no endpoint
-        # enters the step after the first displacement.  When the energy
-        # falls toward both endpoints there is no reaction left to climb
-        # in this direction, so ascending walks out of the channel --
-        # drop the ascent component for this step and relax the rest.
-        self._climbing = not (np.dot(g, dxi) < 0 and np.dot(g, dxf) < 0)
-        if not self._climbing:
-            eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
-        elif ((eigs_B[0] > 0 or n <= self.min_directed_steps)
-                and self._directed):
+        if eigs_B[0] < 0:
+            self._unlatch_streak += 1
+        else:
+            self._unlatch_streak = 0
+        directed = (self._unlatch_streak < self.unlatch_persist
+                    and self._directed)
+        if directed:
             first_column = dxi_to_f.copy()
             if self.target_indices:
                 for i in range(len(self.indices)):
@@ -97,6 +94,13 @@ class SaddleClimb:
             eigs_tmp, vecs_tmp = LA.eigh(B_new)
         else:
             eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
+        vmax = vecs_tmp[:, 0]
+        ascent_dir = vmax if np.dot(g, vmax) > 0 else -vmax
+        self._climbing = not (np.dot(ascent_dir, dxi) < 0
+                              and np.dot(ascent_dir, dxf) < 0)
+        if not self._climbing:
+            eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
+        elif not directed:
             self._directed = False
 
         for i, eig in enumerate(eigs_tmp):
@@ -334,13 +338,15 @@ class SaddleClimb:
         if self._restart:
             n = self._restart_trajectory.info['saddleclimb_iterations']
             self._directed = self._restart_trajectory.info['directed']
+            self._unlatch_streak = self._restart_trajectory.info.get(
+                'unlatch_streak', 0)
             atoms, idx, B = self._initialize_atoms_restart()
             traj, g, E, Fmax = self._initialize_run_restart(idx)
             self._pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
             self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
             pos_1D = atoms.positions[idx, :].reshape(-1)
             dxi = LA.norm(self._pos_i_1D - pos_1D)
-            B_opt = self._get_B_opt(B, g, pos_1D, n-1)
+            B_opt = self._get_B_opt(B, g, pos_1D)
             dx_1D = self._get_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
         else:
@@ -358,9 +364,8 @@ class SaddleClimb:
             E = atoms.calc.results['energy']
             dg = g - g0
             Fmax = LA.norm(-g.reshape(-1, 3), axis=1).max()
-
             B = self._update_hessian(B, dg, dx_1D)
-            B_opt = self._get_B_opt(B, g, pos_1D, n)
+            B_opt = self._get_B_opt(B, g, pos_1D)
             dx_1D = self._get_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
             n += 1
@@ -370,8 +375,7 @@ class SaddleClimb:
             atoms.info["saddleclimb_hessian_shape"] = B.shape
             atoms.info['saddleclimb_iterations'] = n + 0
             atoms.info['directed'] = self._directed
-            # write a snapshot: some calculators (e.g. MACE) invalidate their
-            # results when atoms.info changes, which would drop the energy
+            atoms.info['unlatch_streak'] = self._unlatch_streak
             image = atoms.copy()
             image.calc = SinglePointCalculator(image, energy=E, forces=f)
             traj.write(image)
