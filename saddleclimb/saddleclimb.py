@@ -9,7 +9,6 @@ from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io.trajectory import Trajectory
 from scipy.optimize import brentq
 from pathlib import Path
-import copy
 
 
 class SaddleClimb:
@@ -252,7 +251,7 @@ class SaddleClimb:
         atoms = self.atoms_initial.copy()
         constraints = self.atoms_initial.constraints.copy()
         atoms.set_constraint(constraints)
-        atoms.calc = copy.deepcopy(self.calculator)
+        atoms.calc = self.calculator
         idx = self.indices.copy()
         B_init = self.hessian.copy()
         return atoms, idx, B_init
@@ -263,7 +262,7 @@ class SaddleClimb:
         atoms = self._restart_trajectory.copy()
         constraints = self._restart_trajectory.constraints.copy()
         atoms.set_constraint(constraints)
-        atoms.calc = copy.deepcopy(self.calculator)
+        atoms.calc = self.calculator
         idx = self.indices.copy()
         B_init = np.array(atoms.info["saddleclimb_hessian"])
 
@@ -385,7 +384,7 @@ class SaddleClimb:
     def restart_climb(self, restart_trajectory: Atoms):
         assert 'saddleclimb_hessian' in restart_trajectory.info
         self._restart = True
-        self._restart_trajectory = copy.deepcopy(restart_trajectory)
+        self._restart_trajectory = restart_trajectory
         self.climb()
 
     def normalize(self: None, v: np.ndarray) -> np.ndarray:
