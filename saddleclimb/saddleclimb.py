@@ -77,8 +77,12 @@ class SaddleClimb:
             self._unlatch_streak += 1
         else:
             self._unlatch_streak = 0
-        directed = (self._unlatch_streak < self.unlatch_persist
-                    and self._directed)
+        # The gate is live, not a latch: the lowest mode has to stay
+        # negative for unlatch_persist consecutive steps before free
+        # climb becomes an option, and a single non-negative step resets
+        # the streak and hands the climb back to the directed branch.
+        directed = self._unlatch_streak < self.unlatch_persist
+        self._directed = directed
         if directed:
             first_column = dxi_to_f.copy()
             if self.target_indices:
@@ -99,8 +103,6 @@ class SaddleClimb:
                               and np.dot(ascent_dir, dxf) < 0)
         if not self._climbing:
             eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
-        elif not directed:
-            self._directed = False
 
         for i, eig in enumerate(eigs_tmp):
             if i == 0 and self._climbing:
@@ -336,7 +338,6 @@ class SaddleClimb:
         self._initialize_logging()
         if self._restart:
             n = self._restart_trajectory.info['saddleclimb_iterations']
-            self._directed = self._restart_trajectory.info['directed']
             self._unlatch_streak = self._restart_trajectory.info.get(
                 'unlatch_streak', 0)
             atoms, idx, B = self._initialize_atoms_restart()

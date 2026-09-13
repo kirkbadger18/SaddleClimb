@@ -182,7 +182,7 @@ def test_climb_guard_reads_ascent_direction_not_gradient():
     n = 3 * len(idx)
     climber._pos_i_1D = climber.atoms_initial.positions[idx, :].reshape(-1)
     climber._pos_f_1D = climber.atoms_final.positions[idx, :].reshape(-1)
-    climber._directed = False
+    climber._unlatch_streak = climber.unlatch_persist
 
     half = (climber._pos_f_1D - climber._pos_i_1D) / 2
     chord = climber.normalize(half)
@@ -217,7 +217,7 @@ def test_climb_guard_reads_ascent_direction_not_gradient():
 def test_climb_guard_is_live_during_directed_climb():
     """The guard applies to the biased mode as well as the free one.
 
-    While ``_directed`` holds, the QR surgery makes dhat an exact
+    While the directed branch holds, the QR surgery makes dhat an exact
     eigenvector, so the ascent direction is +/- dhat.  With
     t = dhat.(pos - pos_i) and L = dhat.(pos_f - pos_i), the endpoint
     dots are -t and L - t, so the guard fires exactly on overshoot --
@@ -242,7 +242,6 @@ def test_climb_guard_is_live_during_directed_climb():
     def guard(frac, sign):
         pos_1D = climber._pos_i_1D + frac * chord
         g = sign * 0.5 * dhat + 0.02 * basis[:, 1]
-        climber._directed = True
         B_opt = climber._get_B_opt(B, g, pos_1D)
         vmax = LA.eigh(B_opt)[1][:, 0]
         assert_allclose(abs(np.dot(vmax, dhat)), 1.0, atol=1e-10)
@@ -261,3 +260,74 @@ def test_climb_guard_is_live_during_directed_climb():
     # The opposite orientation still points back at an endpoint.
     assert guard(1.3, -1)
     assert guard(-0.1, +1)
+
+
+def test_free_climb_gate_is_live_not_latched():
+    """A mode that goes negative then positive again re-biases the climb.
+
+    ``unlatch_persist`` gates free climb rather than unlatching it: the
+    lowest mode of the free Hessian has to stay negative for that many
+    consecutive steps before the endpoint bias is dropped, and the first
+    step whose lowest mode comes back non-negative resets the streak and
+    puts the climb back on the directed branch.
+    """
+    climber = generate_saddleclimb_object()
+    idx = climber.indices
+    n = 3 * len(idx)
+    climber._pos_i_1D = climber.atoms_initial.positions[idx, :].reshape(-1)
+    climber._pos_f_1D = climber.atoms_final.positions[idx, :].reshape(-1)
+    chord = climber._pos_f_1D - climber._pos_i_1D
+    dhat = climber.normalize(chord)
+    basis, _ = LA.qr(dhat.reshape(n, 1), mode='complete')
+    off = basis[:, 1]
+    pos_1D = climber._pos_i_1D + 0.5 * chord
+    g = 0.5 * dhat + 0.5 * off
+
+    def hessian(dhat_diagonal, coupling):
+        """dhat carries the softest diagonal, coupled to one off mode.
+
+        The QR surgery zeroes that coupling, so the directed branch
+        climbs dhat exactly.  Left coupled, the free lowest mode leans
+        off the chord, and its sign is set by ``dhat_diagonal`` against
+        the coupling.
+        """
+        B = dhat_diagonal * np.outer(dhat, dhat)
+        B += 5.0 * (np.eye(n) - np.outer(dhat, dhat))
+        B += coupling * (np.outer(dhat, off) + np.outer(off, dhat))
+        return B
+
+    B_neg = hessian(-3.0, 4.0)
+    B_pos = hessian(1.0, 1.0)
+    assert LA.eigh(B_neg)[0][0] < 0
+    assert LA.eigh(B_pos)[0][0] > 0
+
+    def off_component(B):
+        """|vmax.off| for the climbed mode: 0 on the directed branch."""
+        vmax = LA.eigh(climber._get_B_opt(B, g, pos_1D))[1][:, 0]
+        assert climber._climbing
+        assert_allclose(abs(np.dot(vmax, dhat))**2 + np.dot(vmax, off)**2,
+                        1.0, atol=1e-10)
+        return abs(np.dot(vmax, off))
+
+    # The bias holds while the negative mode is younger than the gate.
+    for _ in range(climber.unlatch_persist - 1):
+        assert_allclose(off_component(B_neg), 0.0, atol=1e-10)
+        assert climber._directed
+
+    # Once it has persisted, the climb follows the free mode.
+    assert off_component(B_neg) > 0.3
+    assert not climber._directed
+    assert off_component(B_neg) > 0.3
+    assert not climber._directed
+
+    # A single non-negative step hands the climb straight back to the bias.
+    assert_allclose(off_component(B_pos), 0.0, atol=1e-10)
+    assert climber._directed
+    assert climber._unlatch_streak == 0
+
+    # And the gate has to be earned again from scratch.
+    for _ in range(climber.unlatch_persist - 1):
+        assert_allclose(off_component(B_neg), 0.0, atol=1e-10)
+        assert climber._directed
+    assert off_component(B_neg) > 0.3
+    assert not climber._directed
