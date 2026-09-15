@@ -12,14 +12,14 @@ import tempfile
 import copy
 
 
-def generate_saddleclimb_object():
+def generate_saddleclimb_object(interp='linear'):
     calc = EMT()
     init = fcc111('Pt', size=(3, 3, 4), vacuum=10.0)
     final = fcc111('Pt', size=(3, 3, 4), vacuum=10.0)
     add_adsorbate(init, 'H', 1.5, 'fcc')
     add_adsorbate(final, 'H', 1.5, 'hcp')
     idx = list(range(18, 37))
-    climber = SaddleClimb(init, final, calc, idx)
+    climber = SaddleClimb(init, final, calc, idx, interp=interp)
     return climber
 
 
@@ -182,7 +182,6 @@ def test_climb_guard_reads_ascent_direction_not_gradient():
     n = 3 * len(idx)
     climber._pos_i_1D = climber.atoms_initial.positions[idx, :].reshape(-1)
     climber._pos_f_1D = climber.atoms_final.positions[idx, :].reshape(-1)
-    climber._directed = False
 
     half = (climber._pos_f_1D - climber._pos_i_1D) / 2
     chord = climber.normalize(half)
@@ -207,17 +206,20 @@ def test_climb_guard_reads_ascent_direction_not_gradient():
     assert climber._climbing
 
     # Converse: the gradient still points at the final endpoint, but the
-    # ascent direction is +off, which leads away from both.
+    # ascent direction is +off, which leads away from both.  Asserted on
+    # the guard itself rather than through _get_B_opt: the bias surgery
+    # hands the bias -|lowest eig of B|, so here it ties with off at -5
+    # and the chord may be climbed instead.  Which mode gets selected is
+    # a separate question from what the guard reads.
     g = 8.0 * chord + 0.01 * off
     assert np.dot(g, dxf) > 0
-    climber._get_B_opt(hessian_with_lowest_mode(off), g, pos_1D)
-    assert not climber._climbing
+    assert not climber._is_climbing(off, g, dxi, dxf)
 
 
 def test_climb_guard_is_live_during_directed_climb():
     """The guard applies to the biased mode as well as the free one.
 
-    While ``_directed`` holds, the QR surgery makes dhat an exact
+    On the directed branch the QR surgery makes dhat an exact
     eigenvector, so the ascent direction is +/- dhat.  With
     t = dhat.(pos - pos_i) and L = dhat.(pos_f - pos_i), the endpoint
     dots are -t and L - t, so the guard fires exactly on overshoot --
@@ -242,7 +244,6 @@ def test_climb_guard_is_live_during_directed_climb():
     def guard(frac, sign):
         pos_1D = climber._pos_i_1D + frac * chord
         g = sign * 0.5 * dhat + 0.02 * basis[:, 1]
-        climber._directed = True
         B_opt = climber._get_B_opt(B, g, pos_1D)
         vmax = LA.eigh(B_opt)[1][:, 0]
         assert_allclose(abs(np.dot(vmax, dhat)), 1.0, atol=1e-10)

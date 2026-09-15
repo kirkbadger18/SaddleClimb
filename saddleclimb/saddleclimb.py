@@ -7,7 +7,8 @@ from ase.atoms import Atoms
 from ase.calculators.calculator import Calculator
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io.trajectory import Trajectory
-from scipy.optimize import brentq
+from scipy.optimize import brentq, minimize
+from scipy.spatial.distance import cdist
 from pathlib import Path
 
 
@@ -19,6 +20,8 @@ class SaddleClimb:
             atoms_final: Atoms,
             calculator: Calculator,
             method: str = 'pfro',
+            interp: str = 'qst',
+            delta_f: float = 0.05,
             unlatch_persist: int = 3,
             target_indices: list = None,
             fmax: float = 0.01,
@@ -35,6 +38,9 @@ class SaddleClimb:
         self.target_indices = target_indices
         self.calculator = calculator
         self.method = method
+        assert interp in ('linear', 'qst')
+        self.interp = interp
+        self.delta_f = delta_f
         self.unlatch_persist = unlatch_persist
         self.fmax = fmax
         self.maxstepsize = maxstepsize
@@ -44,13 +50,13 @@ class SaddleClimb:
         self.logfile = logfile
         self.trajfile = trajfile
         self._restart = False
-        self._directed = True
-        self._unlatch_streak = 0
         self._climbing = True
+        self._unlatch_streak = 0
+        self._latched = True
         self._get_moving_atoms()
         if self.target_indices:
             self._get_sub_target_atoms()
-        self.hessian = 70 * np.eye(3*len(self.indices))
+        self.hessian = 50 * np.eye(3*len(self.indices))
 
     def _get_moving_atoms(self):
         dpos = self.atoms_final.positions - self.atoms_initial.positions
@@ -67,40 +73,58 @@ class SaddleClimb:
                 sub_indices.append(i)
         self.sub_target_indices = sub_indices.copy()
 
+    def _get_directed_modes(self, B, pos_1D):
+        """Modes of B with the bias direction decoupled from the rest.
+
+        The bias direction is given a curvature of -min|eigenvalue of
+        B| rather than its own, which is often far stiffer.  The
+        smallest *magnitude* is used, not the algebraically smallest:
+        when B already carries a deep negative mode the latter would
+        hand the bias that same stiff curvature and shrink the climb
+        step.
+        """
+        first_column = self._get_bias_direction(pos_1D)
+        if self.target_indices:
+            for i in range(len(self.indices)):
+                if i not in self.sub_target_indices:
+                    first_column[3*i:3*i+3] = 0
+        new_basis, _ = LA.qr(first_column.reshape(-1, 1), mode='complete')
+        B_transformed = mult(new_basis.T, mult(B, new_basis))
+        B_transformed[1:, 0], B_transformed[0, 1:] = 0, 0
+        B_transformed[0, 0] = -np.abs(LA.eigvalsh(B)).min()
+        B_new = mult(new_basis, mult(B_transformed, new_basis.T))
+        return LA.eigh(B_new)
+
+    def _is_climbing(self, vmax, g, dxi, dxf):
+        """False when the ascent direction leads away from both ends."""
+        ascent_dir = vmax if np.dot(g, vmax) > 0 else -vmax
+        return not (np.dot(ascent_dir, dxi) < 0
+                    and np.dot(ascent_dir, dxf) < 0)
+
     def _get_B_opt(self, B, g, pos_1D):
 
         dxi = self._pos_i_1D - pos_1D
         dxf = self._pos_f_1D - pos_1D
-        dxi_to_f = self._pos_f_1D - self._pos_i_1D
         eigs_B, vecs_B = LA.eigh(B)
         if eigs_B[0] < 0:
             self._unlatch_streak += 1
         else:
             self._unlatch_streak = 0
-        directed = (self._unlatch_streak < self.unlatch_persist
-                    and self._directed)
+        if self._unlatch_streak >= self.unlatch_persist:
+            self._latched = False
+        directed = self._latched or eigs_B[0] >= 0
         if directed:
-            first_column = dxi_to_f.copy()
-            if self.target_indices:
-                for i in range(len(self.indices)):
-                    if i not in self.sub_target_indices:
-                        first_column[3*i:3*i+3] = 0
-            new_basis, _ = LA.qr(first_column.reshape(len(dxi_to_f), 1),
-                                 mode='complete')
-            B_transformed = mult(new_basis.T, mult(B, new_basis))
-            B_transformed[1:, 0], B_transformed[0, 1:] = 0, 0
-            B_new = mult(new_basis, mult(B_transformed, new_basis.T))
-            eigs_tmp, vecs_tmp = LA.eigh(B_new)
+            eigs_tmp, vecs_tmp = self._get_directed_modes(B, pos_1D)
         else:
             eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
-        vmax = vecs_tmp[:, 0]
-        ascent_dir = vmax if np.dot(g, vmax) > 0 else -vmax
-        self._climbing = not (np.dot(ascent_dir, dxi) < 0
-                              and np.dot(ascent_dir, dxf) < 0)
+        self._climbing = self._is_climbing(vecs_tmp[:, 0], g, dxi, dxf)
+        if not self._climbing and not directed:
+            eigs_dir, vecs_dir = self._get_directed_modes(B, pos_1D)
+            self._climbing = self._is_climbing(vecs_dir[:, 0], g, dxi, dxf)
+            if self._climbing:
+                eigs_tmp, vecs_tmp = eigs_dir, vecs_dir
         if not self._climbing:
             eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
-        elif not directed:
-            self._directed = False
 
         for i, eig in enumerate(eigs_tmp):
             if i == 0 and self._climbing:
@@ -336,16 +360,21 @@ class SaddleClimb:
         self._initialize_logging()
         if self._restart:
             n = self._restart_trajectory.info['saddleclimb_iterations']
-            self._directed = self._restart_trajectory.info['directed']
             self._unlatch_streak = self._restart_trajectory.info.get(
                 'unlatch_streak', 0)
+            self._latched = self._restart_trajectory.info.get('latched', True)
             atoms, idx, B = self._initialize_atoms_restart()
             traj, g, E, Fmax = self._initialize_run_restart(idx)
             self._pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
             self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
             pos_1D = atoms.positions[idx, :].reshape(-1)
             dxi = LA.norm(self._pos_i_1D - pos_1D)
+            # This re-derives the step the interrupted run had already
+            # taken, so the latch counters must not advance a second
+            # time for it.
+            streak, latched = self._unlatch_streak, self._latched
             B_opt = self._get_B_opt(B, g, pos_1D)
+            self._unlatch_streak, self._latched = streak, latched
             dx_1D = self._get_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
         else:
@@ -373,8 +402,8 @@ class SaddleClimb:
             atoms.info["saddleclimb_hessian"] = B.tolist()
             atoms.info["saddleclimb_hessian_shape"] = B.shape
             atoms.info['saddleclimb_iterations'] = n + 0
-            atoms.info['directed'] = self._directed
             atoms.info['unlatch_streak'] = self._unlatch_streak
+            atoms.info['latched'] = self._latched
             image = atoms.copy()
             image.calc = SinglePointCalculator(image, energy=E, forces=f)
             traj.write(image)
@@ -386,6 +415,89 @@ class SaddleClimb:
         self._restart = True
         self._restart_trajectory = restart_trajectory
         self.climb()
+
+    def _get_bias_direction(self, pos_1D: np.ndarray) -> np.ndarray:
+        """Direction the climb is biased along, over the moving atoms."""
+        if self.interp == 'linear':
+            return self._pos_f_1D - self._pos_i_1D
+        pos = self.atoms_initial.positions.copy()
+        pos[self.indices, :] = pos_1D.reshape(-1, 3)
+        p_m = self._get_path_coordinate(pos)
+        f_minus = max(p_m - self.delta_f, 0)
+        f_plus = min(p_m + self.delta_f, 1)
+        pos_minus = self.get_positions_from_distances(
+            self.get_qst_distances(pos, f_minus), pos, self.indices)
+        pos_plus = self.get_positions_from_distances(
+            self.get_qst_distances(pos, f_plus), pos, self.indices)
+        return (pos_plus - pos_minus)[self.indices, :].reshape(-1)
+
+    def _get_path_coordinate(self, positions: np.ndarray) -> float:
+        """Path coordinate p of a structure, eqs. (4) and (5)."""
+        norm = np.sqrt(len(positions))
+        d_R = LA.norm(positions - self.atoms_initial.positions) / norm
+        d_P = LA.norm(positions - self.atoms_final.positions) / norm
+        return d_R / (d_R + d_P)
+
+    def get_qst_distances(self, positions: np.ndarray,
+                          f: float) -> np.ndarray:
+        """Interpolated distance matrix on the QST path through `positions`.
+
+        Follows eqs. (4)-(7) of Halgren and Lipscomb, Chem. Phys. Lett.
+        49 (1977) 225: the path coordinate p_m of the intermediate
+        structure sets the quadratic term, and `f` is the interpolation
+        parameter at which the distances are evaluated.
+        """
+        pos_R = self.atoms_initial.positions
+        pos_P = self.atoms_final.positions
+        p_m = self._get_path_coordinate(positions)
+        r_R = cdist(pos_R, pos_R)
+        r_P = cdist(pos_P, pos_P)
+        r_M = cdist(positions, positions)
+        denom = p_m * (1 - p_m)
+        if denom == 0:
+            gamma = np.zeros_like(r_M)
+        else:
+            gamma = (r_M - (1 - p_m) * r_R - p_m * r_P) / denom
+        return (1 - f) * r_R + f * r_P + gamma * f * (1 - f)
+
+    def get_positions_from_distances(self, r_interp: np.ndarray,
+                                     positions_guess: np.ndarray,
+                                     indices: list = None) -> np.ndarray:
+        """Cartesian positions that best reproduce `r_interp`.
+
+        Minimizes S of eq. (3) of Halgren and Lipscomb, Chem. Phys.
+        Lett. 49 (1977) 225, starting from (and weakly tethered to)
+        `positions_guess`.  Every pair distance enters S, but only
+        atoms in `indices` are free to move; the rest are held at their
+        guessed positions, where they still constrain the free atoms
+        through their shared pairs.  `indices=None` frees every atom.
+        Returns an array shaped like `atoms.positions`.
+        """
+        free = (np.arange(len(positions_guess)) if indices is None
+                else np.asarray(indices))
+        iu = np.triu_indices(len(positions_guess), k=1)
+        r_i = r_interp[iu]
+        w = 1 / r_i**4
+        x0 = positions_guess[free].reshape(-1)
+
+        def S_and_grad(x):
+            pos = positions_guess.copy()
+            pos[free] = x.reshape(-1, 3)
+            dpos = pos[:, None, :] - pos[None, :, :]
+            r_c = np.sqrt((dpos**2).sum(-1))
+            dr = r_c[iu] - r_i
+            dx = x - x0
+            S = np.sum(w * dr**2) + 1e-6 * np.sum(dx**2)
+            c = np.zeros_like(r_c)
+            c[iu] = 2 * w * dr / r_c[iu]
+            c += c.T
+            grad = (c[:, :, None] * dpos).sum(axis=1)[free].reshape(-1)
+            return S, grad + 2e-6 * dx
+
+        res = minimize(S_and_grad, x0, jac=True, method='L-BFGS-B')
+        out = positions_guess.copy()
+        out[free] = res.x.reshape(-1, 3)
+        return out
 
     def normalize(self: None, v: np.ndarray) -> np.ndarray:
         norm = LA.norm(v)
