@@ -19,18 +19,23 @@ class SaddleClimb:
             atoms_initial: Atoms,
             atoms_final: Atoms,
             calculator: Calculator,
-            method: str = 'pfro',
-            interp: str = 'qst',
-            delta_f: float = 0.05,
-            unlatch_persist: int = 3,
-            target_indices: list = None,
             fmax: float = 0.01,
-            maxstepsize: float = 0.2,
-            a_max: float = 1,
-            max_scaling_halvings: int = 60,
-            delta0: float = 0.05,
+            target_indices: list = None,
             logfile: str = 'climb.log',
             trajfile: str = 'climb.traj',
+            method: str = 'pfro',
+            interp: str = 'qst',
+
+            delta0: float = 0.05,
+            hessian_scale: float = 50,
+            unlatch_persist: int = 3,
+            maxstep_climb: float = 0.2,
+            maxstep_descend: float = 0.05,
+            minstep_climb: float = 0.01,
+            min_travel: float = 0.1,
+            a_max: float = 1,
+            max_scaling_halvings: int = 60,
+            delta_f: float = 0.05,
             ) -> None:
 
         self.atoms_initial = atoms_initial
@@ -41,9 +46,18 @@ class SaddleClimb:
         assert interp in ('linear', 'qst')
         self.interp = interp
         self.delta_f = delta_f
-        self.unlatch_persist = unlatch_persist
         self.fmax = fmax
-        self.maxstepsize = maxstepsize
+        # Separate trust radii for the two P-RFO partitions.  Their
+        # sum bounds the combined step.
+        self.maxstep_climb = maxstep_climb
+        self.maxstep_descend = maxstep_descend
+        # Floor on the climb component, applied only while the climb is
+        # still within min_travel of the initial structure -- the same
+        # condition that keeps the run from converging there.
+        self.minstep_climb = minstep_climb
+        self.min_travel = min_travel
+        self.hessian_scale = hessian_scale
+        self.unlatch_persist = unlatch_persist
         self.a_max = a_max
         self.max_scaling_halvings = max_scaling_halvings
         self.delta = delta0
@@ -51,12 +65,14 @@ class SaddleClimb:
         self.trajfile = trajfile
         self._restart = False
         self._climbing = True
+        self._near_initial = True
         self._unlatch_streak = 0
         self._latched = True
         self._get_moving_atoms()
         if self.target_indices:
             self._get_sub_target_atoms()
-        self.hessian = 50 * np.eye(3*len(self.indices))
+        self.hessian = (hessian_scale
+                        * np.eye(3*len(self.indices)))
 
     def _get_moving_atoms(self):
         dpos = self.atoms_final.positions - self.atoms_initial.positions
@@ -76,12 +92,9 @@ class SaddleClimb:
     def _get_directed_modes(self, B, pos_1D):
         """Modes of B with the bias direction decoupled from the rest.
 
-        The bias direction is given a curvature of -min|eigenvalue of
-        B| rather than its own, which is often far stiffer.  The
-        smallest *magnitude* is used, not the algebraically smallest:
-        when B already carries a deep negative mode the latter would
-        hand the bias that same stiff curvature and shrink the climb
-        step.
+        The bias keeps its own curvature; step sizes are regulated by
+        the separate climb and descent trust radii, not by editing
+        eigenvalues.
         """
         first_column = self._get_bias_direction(pos_1D)
         if self.target_indices:
@@ -91,7 +104,6 @@ class SaddleClimb:
         new_basis, _ = LA.qr(first_column.reshape(-1, 1), mode='complete')
         B_transformed = mult(new_basis.T, mult(B, new_basis))
         B_transformed[1:, 0], B_transformed[0, 1:] = 0, 0
-        B_transformed[0, 0] = -np.abs(LA.eigvalsh(B)).min()
         B_new = mult(new_basis, mult(B_transformed, new_basis.T))
         return LA.eigh(B_new)
 
@@ -143,47 +155,47 @@ class SaddleClimb:
 
         inv_B_temp = LA.inv(B_opt)
         dx_1D = -mult(inv_B_temp, g)
+        radius = self.maxstep_climb + self.maxstep_descend
         maxstep = self._get_maxstep(dx_1D)
-        if maxstep > self.maxstepsize:
-            dx_1D *= self.maxstepsize / maxstep
+        if maxstep > radius:
+            dx_1D *= radius / maxstep
 
         return dx_1D
 
-    def _get_scaled_pfro_step(self, B_opt, g, vmin, vmax, a):
+    def _get_scaled_climb_step(self, B_opt, g, vmax, a):
         """
-        Partitioned RFO step for a given RFO scaling parameter ``a``.
+        Climb component of the P-RFO step, maximised along ``vmax``.
 
-        The step is maximised along ``vmax`` and minimised in the space
-        spanned by ``vmin``.  ``a`` acts as a trust radius control: the
-        step tends to zero as a -> 0 and to the full Newton/RFO step as
-        a -> inf.
-
-        When the guard has cleared ``_climbing`` the ``vmax`` component is
-        nulled rather than descended: climb and descent would otherwise be
-        the same mode pulling opposite ways.  What is left relaxes
-        everything perpendicular to it.
+        When the guard has cleared ``_climbing`` this component is
+        nulled rather than descended: climb and descent would otherwise
+        be the same mode pulling opposite ways, and what is left
+        relaxes everything perpendicular to it.
         """
-        Ndim = len(g)
+        if not self._climbing:
+            return np.zeros_like(g)
         climb_M = np.array([
             [a**2*mult(vmax.T, mult(B_opt, vmax)), a*mult(vmax.T, g)],
             [a*mult(g.T, vmax), 0]
         ])
+        _, svecs_max = LA.eigh(climb_M)
+        return (a*svecs_max[0, 1] / svecs_max[1, 1]) * vmax
+
+    def _get_scaled_descend_step(self, B_opt, g, vmin, a):
+        """Descent component, minimised in the space spanned by ``vmin``."""
+        Ndim = len(g)
         descend_M = np.zeros([Ndim, Ndim])
         descend_M[0:Ndim-1, 0:Ndim-1] = a**2*mult(vmin.T, mult(B_opt, vmin))
         descend_M[-1, 0:Ndim-1] = a*mult(vmin.T, g)
         descend_M[0:Ndim-1, -1] = a*mult(g.T, vmin)
         _, svecs_min = LA.eigh(descend_M)
-        _, svecs_max = LA.eigh(climb_M)
-        smax = a*svecs_max[0, 1] / svecs_max[1, 1] if self._climbing else 0
         smin = (a / svecs_min[-1, 0]) * svecs_min[0:Ndim-1, 0]
-        step = smax * vmax + mult(vmin, smin)
-        return step
+        return mult(vmin, smin)
 
-    def _get_pfro_scaling(self, B_opt, g, vmin, vmax):
+    def _get_pfro_scaling(self, component, radius):
         """
-        Pick the RFO scaling ``a``, starting from the nominal
-        ``self.a_max`` and reducing it only if that step would leave the
-        trust radius ``self.maxstepsize``.
+        Pick the RFO scaling ``a`` for one step component, starting from
+        the nominal ``self.a_max`` and reducing it only if that
+        component would leave its own trust ``radius``.
 
         Near convergence the nominal step is already well inside the
         radius -- it approaches the Newton step, which shrinks with the
@@ -196,9 +208,7 @@ class SaddleClimb:
         no force evaluations.
         """
         def excess(log_a):
-            step = self._get_scaled_pfro_step(B_opt, g, vmin, vmax,
-                                              np.exp(log_a))
-            return self._get_maxstep(step) - self.maxstepsize
+            return self._get_maxstep(component(np.exp(log_a))) - radius
 
         log_hi = np.log(self.a_max)
         if excess(log_hi) <= 0:
@@ -220,20 +230,36 @@ class SaddleClimb:
 
     def _get_pfro_step(self, B_opt, g, a=None):
         """
-        Partitioned RFO step.  With ``a=None`` the nominal scaling
-        ``self.a_max`` is used, reduced only far enough to keep the step
-        within the trust radius; passing an explicit ``a`` skips that
-        entirely.  The linear truncation is kept as a safety net for the
-        case where no bracket could be found.
+        Partitioned RFO step.  Each partition gets its own scaling
+        ``a``, found independently against its own trust radius, so a
+        binding radius on one does not shrink the other.  With an
+        explicit ``a`` the search is skipped for both.  The linear
+        truncation is kept as a safety net: the bracket is closed only
+        to ``xtol`` in log(a), and for the case where no bracket could
+        be found at all.
         """
         _, vecs = LA.eigh(B_opt)
         vmin, vmax = vecs[:, 1:], vecs[:, 0]
-        if a is None:
-            a = self._get_pfro_scaling(B_opt, g, vmin, vmax)
-        step = self._get_scaled_pfro_step(B_opt, g, vmin, vmax, a)
-        maxstep = self._get_maxstep(step)
-        if maxstep > self.maxstepsize:
-            step *= self.maxstepsize / maxstep
+
+        def climb(scale):
+            return self._get_scaled_climb_step(B_opt, g, vmax, scale)
+
+        def descend(scale):
+            return self._get_scaled_descend_step(B_opt, g, vmin, scale)
+
+        floor = self.minstep_climb if self._near_initial else 0.0
+        step = np.zeros_like(g)
+        for component, radius, low in ((climb, self.maxstep_climb, floor),
+                                       (descend, self.maxstep_descend, 0.0)):
+            scale = a if a is not None else self._get_pfro_scaling(component,
+                                                                   radius)
+            part = component(scale)
+            maxstep = self._get_maxstep(part)
+            if maxstep > radius:
+                part = part * (radius / maxstep)
+            elif low > 0 and 0 < maxstep < low:
+                part = part * (min(low, radius) / maxstep)
+            step = step + part
         return step
 
     def _get_step(self, B_opt, g):
@@ -362,16 +388,17 @@ class SaddleClimb:
             n = self._restart_trajectory.info['saddleclimb_iterations']
             self._unlatch_streak = self._restart_trajectory.info.get(
                 'unlatch_streak', 0)
-            self._latched = self._restart_trajectory.info.get('latched', True)
+            self._latched = self._restart_trajectory.info.get(
+                'latched', True)
             atoms, idx, B = self._initialize_atoms_restart()
             traj, g, E, Fmax = self._initialize_run_restart(idx)
             self._pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
             self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
             pos_1D = atoms.positions[idx, :].reshape(-1)
             dxi = LA.norm(self._pos_i_1D - pos_1D)
+            self._near_initial = dxi < self.min_travel
             # This re-derives the step the interrupted run had already
-            # taken, so the latch counters must not advance a second
-            # time for it.
+            # taken, so the latch counters must not advance for it.
             streak, latched = self._unlatch_streak, self._latched
             B_opt = self._get_B_opt(B, g, pos_1D)
             self._unlatch_streak, self._latched = streak, latched
@@ -382,10 +409,11 @@ class SaddleClimb:
             traj, g, E = self._initialize_run(atoms, idx)
             dx, dx_1D = self._get_initial_step(idx)
             Fmax, dxi, n = 1, 0, 0
-        while Fmax > self.fmax or dxi < 0.1:
+        while Fmax > self.fmax or dxi < self.min_travel:
             atoms.positions[idx, :] += dx
             pos_1D = atoms.positions[idx, :].reshape(-1)
             dxi = LA.norm(self._pos_i_1D - pos_1D)
+            self._near_initial = dxi < self.min_travel
             g0 = g
             f = self._get_F(atoms)
             g = -f[idx, :].reshape(-1)
