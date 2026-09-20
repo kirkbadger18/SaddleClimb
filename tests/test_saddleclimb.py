@@ -40,10 +40,8 @@ def test__init__():
     assert isinstance(climber.calculator, Calculator)
     assert climber.fmax
     assert type(climber.fmax) is float
-    assert climber.maxstep_climb
-    assert type(climber.maxstep_climb) is float
-    assert climber.maxstep_descend
-    assert type(climber.maxstep_descend) is float
+    assert climber.maxstep
+    assert type(climber.maxstep) is float
     assert climber.delta
     assert type(climber.delta) is float
     assert climber.logfile
@@ -169,8 +167,7 @@ def test_pfro_step_nulls_ascent_when_not_climbing():
         assert_allclose(np.dot(step, vmax), 0, atol=1e-12)
         assert np.dot(g, step) < 0
         assert (climber._get_maxstep(step)
-                <= climber.maxstep_climb + climber.maxstep_descend
-                + 1e-9)
+                <= climber.maxstep + 1e-9)
 
 
 def test_climb_guard_reads_ascent_direction_not_gradient():

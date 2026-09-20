@@ -8,7 +8,7 @@ from ase.calculators.calculator import Calculator
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io.trajectory import Trajectory
 from scipy.optimize import brentq, minimize
-from scipy.spatial.distance import cdist
+from ase.geometry import find_mic
 from pathlib import Path
 
 
@@ -26,13 +26,13 @@ class SaddleClimb:
             method: str = 'pfro',
             interp: str = 'qst',
 
-            delta0: float = 0.05,
+            delta0: float = 0.1,
             hessian_scale: float = 50,
-            unlatch_persist: int = 3,
-            maxstep_climb: float = 0.2,
-            maxstep_descend: float = 0.05,
-            minstep_climb: float = 0.01,
+            min_directed_steps: int = 5,
+            maxstep: float = 0.2,
+
             min_travel: float = 0.1,
+            a_climb_mult: float = 20,
             a_max: float = 1,
             max_scaling_halvings: int = 60,
             delta_f: float = 0.05,
@@ -47,17 +47,19 @@ class SaddleClimb:
         self.interp = interp
         self.delta_f = delta_f
         self.fmax = fmax
-        # Separate trust radii for the two P-RFO partitions.  Their
-        # sum bounds the combined step.
-        self.maxstep_climb = maxstep_climb
-        self.maxstep_descend = maxstep_descend
-        # Floor on the climb component, applied only while the climb is
-        # still within min_travel of the initial structure -- the same
-        # condition that keeps the run from converging there.
-        self.minstep_climb = minstep_climb
+        # Trust radius on the whole step.
+        self.maxstep = maxstep
         self.min_travel = min_travel
         self.hessian_scale = hessian_scale
-        self.unlatch_persist = unlatch_persist
+        # The bias steers the climb for this many steps, while the
+        # Hessian is still too immature for its lowest mode to be
+        # trusted.  After that the sign of that mode decides.
+        self.min_directed_steps = min_directed_steps
+        # The climb partition is scaled by this multiple of the
+        # descent scaling.  The two are solved together, so this
+        # sets the climb-to-descent ratio without changing the
+        # length of the assembled step.
+        self.a_climb_mult = a_climb_mult
         self.a_max = a_max
         self.max_scaling_halvings = max_scaling_halvings
         self.delta = delta0
@@ -65,14 +67,35 @@ class SaddleClimb:
         self.trajfile = trajfile
         self._restart = False
         self._climbing = True
-        self._near_initial = True
-        self._unlatch_streak = 0
-        self._latched = True
+        self._step_count = 0
         self._get_moving_atoms()
         if self.target_indices:
             self._get_sub_target_atoms()
         self.hessian = (hessian_scale
                         * np.eye(3*len(self.indices)))
+        self._mic_offset = self._get_mic_offset()
+
+    def _get_mic_offset(self):
+        """Lattice shift making every pair minimum-image.
+
+        Resolved once from the initial structure.  A pair only changes
+        image near the half-cell surface, far outside bonding range, so
+        the choice holds for the whole climb.
+        """
+        pos = self.atoms_initial.positions
+        raw = pos[:, None, :] - pos[None, :, :]
+        mic, _ = find_mic(raw.reshape(-1, 3), self.atoms_initial.cell,
+                          self.atoms_initial.pbc)
+        return mic.reshape(raw.shape) - raw
+
+    def _pair_vectors(self, positions):
+        """Minimum-image vector between every pair of atoms."""
+        return (positions[:, None, :] - positions[None, :, :]
+                + self._mic_offset)
+
+    def _pair_distances(self, positions):
+        """Minimum-image distance between every pair of atoms."""
+        return LA.norm(self._pair_vectors(positions), axis=-1)
 
     def _get_moving_atoms(self):
         dpos = self.atoms_final.positions - self.atoms_initial.positions
@@ -118,13 +141,8 @@ class SaddleClimb:
         dxi = self._pos_i_1D - pos_1D
         dxf = self._pos_f_1D - pos_1D
         eigs_B, vecs_B = LA.eigh(B)
-        if eigs_B[0] < 0:
-            self._unlatch_streak += 1
-        else:
-            self._unlatch_streak = 0
-        if self._unlatch_streak >= self.unlatch_persist:
-            self._latched = False
-        directed = self._latched or eigs_B[0] >= 0
+        directed = (self._step_count < self.min_directed_steps
+                    or eigs_B[0] >= 0)
         if directed:
             eigs_tmp, vecs_tmp = self._get_directed_modes(B, pos_1D)
         else:
@@ -148,17 +166,22 @@ class SaddleClimb:
         return B_opt
 
     def _get_maxstep(self, dx_1D: np.ndarray) -> float:
-        """Largest single-atom displacement in a flattened step."""
+        """Displacement of the furthest-moving atom.
+
+        The one distance convention used throughout: every step
+        length, floor and travel threshold means "how far the
+        atom that moves most moves".  Independent of system size,
+        and the same reduction ``Fmax`` uses for forces.
+        """
         return LA.norm(dx_1D.reshape(-1, 3), axis=1).max()
 
     def _get_newton_step(self, B_opt, g):
 
         inv_B_temp = LA.inv(B_opt)
         dx_1D = -mult(inv_B_temp, g)
-        radius = self.maxstep_climb + self.maxstep_descend
-        maxstep = self._get_maxstep(dx_1D)
-        if maxstep > radius:
-            dx_1D *= radius / maxstep
+        stepsize = self._get_maxstep(dx_1D)
+        if stepsize > self.maxstep:
+            dx_1D *= self.maxstep / stepsize
 
         return dx_1D
 
@@ -208,7 +231,8 @@ class SaddleClimb:
         no force evaluations.
         """
         def excess(log_a):
-            return self._get_maxstep(component(np.exp(log_a))) - radius
+            return (self._get_maxstep(component(np.exp(log_a)))
+                    - radius)
 
         log_hi = np.log(self.a_max)
         if excess(log_hi) <= 0:
@@ -230,13 +254,16 @@ class SaddleClimb:
 
     def _get_pfro_step(self, B_opt, g, a=None):
         """
-        Partitioned RFO step.  Each partition gets its own scaling
-        ``a``, found independently against its own trust radius, so a
-        binding radius on one does not shrink the other.  With an
-        explicit ``a`` the search is skipped for both.  The linear
-        truncation is kept as a safety net: the bracket is closed only
-        to ``xtol`` in log(a), and for the case where no bracket could
-        be found at all.
+        Partitioned RFO step.  One scaling is solved for the whole
+        step against the single trust radius ``maxstep``, with the
+        climb partition taking ``a_climb_mult`` times the descent
+        scaling.  Both partitions therefore move together, and the
+        multiplier sets how the fixed step length is divided
+        between climbing and relaxing.  With an explicit ``a`` the
+        search is skipped.  The linear truncation is kept as a
+        safety net: the bracket is closed only to ``xtol`` in
+        log(a), and for the case where no bracket could be found
+        at all.
         """
         _, vecs = LA.eigh(B_opt)
         vmin, vmax = vecs[:, 1:], vecs[:, 0]
@@ -247,19 +274,15 @@ class SaddleClimb:
         def descend(scale):
             return self._get_scaled_descend_step(B_opt, g, vmin, scale)
 
-        floor = self.minstep_climb if self._near_initial else 0.0
-        step = np.zeros_like(g)
-        for component, radius, low in ((climb, self.maxstep_climb, floor),
-                                       (descend, self.maxstep_descend, 0.0)):
-            scale = a if a is not None else self._get_pfro_scaling(component,
-                                                                   radius)
-            part = component(scale)
-            maxstep = self._get_maxstep(part)
-            if maxstep > radius:
-                part = part * (radius / maxstep)
-            elif low > 0 and 0 < maxstep < low:
-                part = part * (min(low, radius) / maxstep)
-            step = step + part
+        def total(scale):
+            return climb(self.a_climb_mult * scale) + descend(scale)
+
+        scale = (a if a is not None
+                 else self._get_pfro_scaling(total, self.maxstep))
+        step = total(scale)
+        stepsize = self._get_maxstep(step)
+        if stepsize > self.maxstep:
+            step = step * (self.maxstep / stepsize)
         return step
 
     def _get_step(self, B_opt, g):
@@ -341,11 +364,15 @@ class SaddleClimb:
             ) -> tuple[np.ndarray, np.ndarray]:
         self._pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
         self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
-        dx_1D = self.delta * self.normalize(self._pos_f_1D - self._pos_i_1D)
+        dx_1D = self._pos_f_1D - self._pos_i_1D
         if self.target_indices:
             for i in range(len(self.indices)):
                 if i not in self.sub_target_indices:
                     dx_1D[3*i:3*i+3] = 0
+        # Held atoms are zeroed first, so delta0 is the length
+        # of the step actually taken, in the same units as the
+        # trust radii.
+        dx_1D = self.delta * dx_1D / self._get_maxstep(dx_1D)
         dx = dx_1D.reshape(-1, 3)
         return dx, dx_1D
 
@@ -386,22 +413,14 @@ class SaddleClimb:
         self._initialize_logging()
         if self._restart:
             n = self._restart_trajectory.info['saddleclimb_iterations']
-            self._unlatch_streak = self._restart_trajectory.info.get(
-                'unlatch_streak', 0)
-            self._latched = self._restart_trajectory.info.get(
-                'latched', True)
             atoms, idx, B = self._initialize_atoms_restart()
             traj, g, E, Fmax = self._initialize_run_restart(idx)
             self._pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
             self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
             pos_1D = atoms.positions[idx, :].reshape(-1)
-            dxi = LA.norm(self._pos_i_1D - pos_1D)
-            self._near_initial = dxi < self.min_travel
-            # This re-derives the step the interrupted run had already
-            # taken, so the latch counters must not advance for it.
-            streak, latched = self._unlatch_streak, self._latched
+            dxi = self._get_maxstep(self._pos_i_1D - pos_1D)
+            self._step_count = n
             B_opt = self._get_B_opt(B, g, pos_1D)
-            self._unlatch_streak, self._latched = streak, latched
             dx_1D = self._get_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
         else:
@@ -412,8 +431,7 @@ class SaddleClimb:
         while Fmax > self.fmax or dxi < self.min_travel:
             atoms.positions[idx, :] += dx
             pos_1D = atoms.positions[idx, :].reshape(-1)
-            dxi = LA.norm(self._pos_i_1D - pos_1D)
-            self._near_initial = dxi < self.min_travel
+            dxi = self._get_maxstep(self._pos_i_1D - pos_1D)
             g0 = g
             f = self._get_F(atoms)
             g = -f[idx, :].reshape(-1)
@@ -421,6 +439,7 @@ class SaddleClimb:
             dg = g - g0
             Fmax = LA.norm(-g.reshape(-1, 3), axis=1).max()
             B = self._update_hessian(B, dg, dx_1D)
+            self._step_count = n
             B_opt = self._get_B_opt(B, g, pos_1D)
             dx_1D = self._get_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
@@ -430,8 +449,6 @@ class SaddleClimb:
             atoms.info["saddleclimb_hessian"] = B.tolist()
             atoms.info["saddleclimb_hessian_shape"] = B.shape
             atoms.info['saddleclimb_iterations'] = n + 0
-            atoms.info['unlatch_streak'] = self._unlatch_streak
-            atoms.info['latched'] = self._latched
             image = atoms.copy()
             image.calc = SinglePointCalculator(image, energy=E, forces=f)
             traj.write(image)
@@ -478,9 +495,9 @@ class SaddleClimb:
         pos_R = self.atoms_initial.positions
         pos_P = self.atoms_final.positions
         p_m = self._get_path_coordinate(positions)
-        r_R = cdist(pos_R, pos_R)
-        r_P = cdist(pos_P, pos_P)
-        r_M = cdist(positions, positions)
+        r_R = self._pair_distances(pos_R)
+        r_P = self._pair_distances(pos_P)
+        r_M = self._pair_distances(positions)
         denom = p_m * (1 - p_m)
         if denom == 0:
             gamma = np.zeros_like(r_M)
@@ -510,17 +527,15 @@ class SaddleClimb:
                 else np.asarray(indices))
         iu = np.triu_indices(len(positions_guess), k=1)
         r_i = r_interp[iu]
-        r_R = cdist(self.atoms_initial.positions,
-                    self.atoms_initial.positions)[iu]
-        r_P = cdist(self.atoms_final.positions,
-                    self.atoms_final.positions)[iu]
+        r_R = self._pair_distances(self.atoms_initial.positions)[iu]
+        r_P = self._pair_distances(self.atoms_final.positions)[iu]
         w = 1 / r_R**4 + 1 / r_P**4
         x0 = positions_guess[free].reshape(-1)
 
         def S_and_grad(x):
             pos = positions_guess.copy()
             pos[free] = x.reshape(-1, 3)
-            dpos = pos[:, None, :] - pos[None, :, :]
+            dpos = self._pair_vectors(pos)
             r_c = np.sqrt((dpos**2).sum(-1))
             dr = r_c[iu] - r_i
             dx = x - x0
