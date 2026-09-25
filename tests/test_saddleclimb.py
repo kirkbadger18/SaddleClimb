@@ -157,6 +157,7 @@ def test_pfro_step_nulls_ascent_when_not_climbing():
         g = rng.standard_normal(n) * 0.3
         _, vecs = LA.eigh(B_opt)
         vmax = vecs[:, 0]
+        climber._climb_mode = vmax
 
         climber._climbing = True
         climbed = climber._get_pfro_step(B_opt, g)
@@ -209,10 +210,9 @@ def test_climb_guard_reads_ascent_direction_not_gradient():
 
     # Converse: the gradient still points at the final endpoint, but the
     # ascent direction is +off, which leads away from both.  Asserted on
-    # the guard itself rather than through _get_B_opt: the bias surgery
-    # hands the bias -|lowest eig of B|, so here it ties with off at -5
-    # and the chord may be climbed instead.  Which mode gets selected is
-    # a separate question from what the guard reads.
+    # the guard itself rather than through _get_B_opt, which climbs the
+    # bias (the chord) while directed.  Which mode gets selected is a
+    # separate question from what the guard reads.
     g = 8.0 * chord + 0.01 * off
     assert np.dot(g, dxf) > 0
     assert not climber._is_climbing(off, g, dxi, dxf)
@@ -246,9 +246,9 @@ def test_climb_guard_is_live_during_directed_climb():
     def guard(frac, sign):
         pos_1D = climber._pos_i_1D + frac * chord
         g = sign * 0.5 * dhat + 0.02 * basis[:, 1]
-        B_opt = climber._get_B_opt(B, g, pos_1D)
-        vmax = LA.eigh(B_opt)[1][:, 0]
-        assert_allclose(abs(np.dot(vmax, dhat)), 1.0, atol=1e-10)
+        climber._get_B_opt(B, g, pos_1D)
+        assert_allclose(abs(np.dot(climber._climb_mode, dhat)), 1.0,
+                        atol=1e-10)
         return climber._climbing
 
     # Between the endpoints the guard cannot fire, either orientation.
@@ -264,3 +264,91 @@ def test_climb_guard_is_live_during_directed_climb():
     # The opposite orientation still points back at an endpoint.
     assert guard(1.3, -1)
     assert guard(-0.1, +1)
+
+
+def test_directed_b_opt_keeps_signs_and_prfo_climbs_convex_bias():
+    """B_opt only decouples the bias; P-RFO still climbs it.
+
+    In a convex basin the bias keeps its positive curvature u^T B u and
+    every other eigenvalue keeps its sign.  P-RFO then steps uphill
+    along the bias and downhill across it.
+    """
+    climber = generate_saddleclimb_object()
+    idx = climber.indices
+    n = 3 * len(idx)
+    climber._pos_i_1D = climber.atoms_initial.positions[idx, :].reshape(-1)
+    climber._pos_f_1D = climber.atoms_final.positions[idx, :].reshape(-1)
+    dhat = climber.normalize(climber._pos_f_1D - climber._pos_i_1D)
+    rng = np.random.default_rng(4)
+    A = rng.standard_normal((n, n))
+    B = A @ A.T + 2 * np.eye(n)
+    g = 0.05 * dhat + 0.3 * climber.normalize(rng.standard_normal(n))
+    pos_1D = climber._pos_i_1D + 0.2 * (climber._pos_f_1D
+                                        - climber._pos_i_1D)
+
+    B_opt = climber._get_B_opt(B, g, pos_1D)
+    assert climber._climbing
+    assert_allclose(abs(np.dot(climber._climb_mode, dhat)), 1, atol=1e-12)
+    assert np.all(LA.eigvalsh(B_opt) > 0)
+    assert_allclose(B_opt @ dhat, (dhat @ B @ dhat) * dhat, atol=1e-10)
+
+    step = climber._get_step(B_opt, g)
+    v = climber._climb_mode
+    assert np.dot(g, v) * np.dot(step, v) > 0
+    across = step - np.dot(step, v) * v
+    assert np.dot(g, across) < 0
+
+
+def test_target_indices_set_the_qst_bias():
+    """Only target atoms enter the path coordinate and the QST bias.
+
+    A surface Pt atom moves between the end states but is not a
+    target, so it may not shift p, and the bias holds it still.
+    """
+    init = fcc111('Pt', size=(3, 3, 4), vacuum=10.0)
+    final = fcc111('Pt', size=(3, 3, 4), vacuum=10.0)
+    add_adsorbate(init, 'H', 1.5, 'fcc')
+    add_adsorbate(final, 'H', 1.5, 'hcp')
+    final.positions[27] += [0.1, 0.05, 0.1]
+    climber = SaddleClimb(init, final, EMT(), target_indices=[36],
+                          interp='qst')
+    assert climber.indices == [27, 36]
+    assert climber._bias_atoms == [36]
+    idx = climber.indices
+    climber._pos_i_1D = init.positions[idx].reshape(-1)
+    climber._pos_f_1D = final.positions[idx].reshape(-1)
+
+    mid = init.positions.copy()
+    mid[36] = 0.7 * init.positions[36] + 0.3 * final.positions[36]
+    p = climber._get_path_coordinate(mid)
+    assert_allclose(p, 0.3, atol=1e-12)
+    shifted = mid.copy()
+    shifted[27] = final.positions[27]
+    assert_allclose(climber._get_path_coordinate(shifted), p, atol=1e-12)
+
+    bias = climber._get_bias_vector(mid[idx].reshape(-1))
+    assert_allclose(bias[:3], 0, atol=1e-12)
+    assert LA.norm(bias[3:]) > 0
+
+    with pytest.raises(ValueError):
+        SaddleClimb(init, final, EMT(), target_indices=[0])
+
+
+def test_negative_streak_latch_releases_and_relatches():
+    """Free climb needs min_negative_streak negative readings in a row.
+
+    A non-negative reading while free re-latches the bias, and the full
+    streak must be met again before the climb is released.
+    """
+    climber = generate_saddleclimb_object()
+    climber.min_negative_streak = 3
+    n = 3 * len(climber.indices)
+
+    def hessian(lowest):
+        return np.diag(np.concatenate(([lowest], np.full(n - 1, 5.0))))
+
+    directed = []
+    for lowest in (-1, -1, -1, -1, 2, -1, -1, -1):
+        climber._update_negative_streak(hessian(lowest))
+        directed.append(climber._is_directed())
+    assert directed == [True, True, False, False, True, True, True, False]
