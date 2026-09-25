@@ -9,5 +9,5 @@ final=read('../../final/opt.traj')
 calc = MACECalculator(model_paths='../../../mace_finetuned.model',
                       default_dtype='float64')
 
-climber = SaddleClimb(init, final, calc, method='newton')
+climber = SaddleClimb(init, final, calc)
 climber.climb(maxsteps=4)

@@ -23,16 +23,14 @@ class SaddleClimb:
             target_indices: list = None,
             logfile: str = 'climb.log',
             trajfile: str = 'climb.traj',
-            method: str = 'pfro',
             interp: str = 'qst',
 
             delta0: float = 0.1,
-            hessian_scale: float = 50,
-            min_directed_steps: int = 5,
+            hessian_scale: float = 20,
+            min_negative_streak: int = 5,
             maxstep: float = 0.2,
 
             min_travel: float = 0.1,
-            a_climb_mult: float = 20,
             a_max: float = 1,
             max_scaling_halvings: int = 60,
             delta_f: float = 0.05,
@@ -42,24 +40,17 @@ class SaddleClimb:
         self.atoms_final = atoms_final
         self.target_indices = target_indices
         self.calculator = calculator
-        self.method = method
         assert interp in ('linear', 'qst')
         self.interp = interp
         self.delta_f = delta_f
         self.fmax = fmax
-        # Trust radius on the whole step.
         self.maxstep = maxstep
         self.min_travel = min_travel
         self.hessian_scale = hessian_scale
-        # The bias steers the climb for this many steps, while the
-        # Hessian is still too immature for its lowest mode to be
-        # trusted.  After that the sign of that mode decides.
-        self.min_directed_steps = min_directed_steps
-        # The climb partition is scaled by this multiple of the
-        # descent scaling.  The two are solved together, so this
-        # sets the climb-to-descent ratio without changing the
-        # length of the assembled step.
-        self.a_climb_mult = a_climb_mult
+        if not min_negative_streak >= 1:
+            raise ValueError('min_negative_streak must be at least 1, '
+                             f'got {min_negative_streak}')
+        self.min_negative_streak = min_negative_streak
         self.a_max = a_max
         self.max_scaling_halvings = max_scaling_halvings
         self.delta = delta0
@@ -67,10 +58,15 @@ class SaddleClimb:
         self.trajfile = trajfile
         self._restart = False
         self._climbing = True
-        self._step_count = 0
+        self._negative_streak = 0
         self._get_moving_atoms()
         if self.target_indices:
             self._get_sub_target_atoms()
+            if not self.sub_target_indices:
+                raise ValueError('no atom in target_indices moves '
+                                 'between the initial and final states')
+        self._bias_atoms = ([self.indices[i] for i in self.sub_target_indices]
+                            if self.target_indices else list(self.indices))
         self.hessian = (hessian_scale
                         * np.eye(3*len(self.indices)))
         self._mic_offset = self._get_mic_offset()
@@ -112,23 +108,33 @@ class SaddleClimb:
                 sub_indices.append(i)
         self.sub_target_indices = sub_indices.copy()
 
-    def _get_directed_modes(self, B, pos_1D):
-        """Modes of B with the bias direction decoupled from the rest.
-
-        The bias keeps its own curvature; step sizes are regulated by
-        the separate climb and descent trust radii, not by editing
-        eigenvalues.
-        """
-        first_column = self._get_bias_direction(pos_1D)
+    def _hold_non_targets(self, v_1D):
+        """Zero the components of atoms outside ``target_indices``."""
         if self.target_indices:
             for i in range(len(self.indices)):
                 if i not in self.sub_target_indices:
-                    first_column[3*i:3*i+3] = 0
+                    v_1D[3*i:3*i+3] = 0
+        return v_1D
+
+    def _get_bias_vector(self, pos_1D):
+        """Bias direction with atoms outside ``target_indices`` held."""
+        return self._hold_non_targets(self._get_bias_direction(pos_1D))
+
+    def _get_directed_hessian(self, B, pos_1D):
+        """
+        B with the bias direction decoupled from the rest.
+
+        The cross terms between the bias and every other direction are
+        nulled; no curvature is changed, so the bias keeps its own
+        curvature u^T B u whatever its sign.  Returns the decoupled
+        Hessian and the unit bias u, an exact eigenvector of it.
+        """
+        first_column = self._get_bias_vector(pos_1D)
         new_basis, _ = LA.qr(first_column.reshape(-1, 1), mode='complete')
         B_transformed = mult(new_basis.T, mult(B, new_basis))
         B_transformed[1:, 0], B_transformed[0, 1:] = 0, 0
         B_new = mult(new_basis, mult(B_transformed, new_basis.T))
-        return LA.eigh(B_new)
+        return B_new, new_basis[:, 0]
 
     def _is_climbing(self, vmax, g, dxi, dxf):
         """False when the ascent direction leads away from both ends."""
@@ -136,33 +142,47 @@ class SaddleClimb:
         return not (np.dot(ascent_dir, dxi) < 0
                     and np.dot(ascent_dir, dxf) < 0)
 
-    def _get_B_opt(self, B, g, pos_1D):
+    def _update_negative_streak(self, B):
+        """Count consecutive Hessian updates whose lowest mode is negative."""
+        if LA.eigvalsh(B)[0] < 0:
+            self._negative_streak += 1
+        else:
+            self._negative_streak = 0
 
+    def _is_directed(self):
+        """Steer by the bias until B's negative mode has persisted."""
+        return self._negative_streak < self.min_negative_streak
+
+    def _get_B_opt(self, B, g, pos_1D):
+        """
+        Hessian handed to P-RFO, and the mode it climbs.
+
+        No eigenvalue signs are changed: P-RFO imposes the saddle shape
+        itself by taking the highest root along the climb mode and the
+        lowest across it, and it climbs a convex mode only if it sees
+        that mode's true, positive curvature.  While directed, the bias
+        is decoupled from the rest of B and climbed; once free, the
+        lowest mode of B is climbed.  The guard falls back to the bias
+        when the free mode leads away from both ends, and clears
+        ``_climbing`` if neither climbs.  The climb mode is stored in
+        ``_climb_mode``.
+        """
         dxi = self._pos_i_1D - pos_1D
         dxf = self._pos_f_1D - pos_1D
         eigs_B, vecs_B = LA.eigh(B)
-        directed = (self._step_count < self.min_directed_steps
-                    or eigs_B[0] >= 0)
+        directed = self._is_directed()
         if directed:
-            eigs_tmp, vecs_tmp = self._get_directed_modes(B, pos_1D)
+            B_opt, v = self._get_directed_hessian(B, pos_1D)
         else:
-            eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
-        self._climbing = self._is_climbing(vecs_tmp[:, 0], g, dxi, dxf)
+            B_opt, v = B, vecs_B[:, 0]
+        self._climbing = self._is_climbing(v, g, dxi, dxf)
         if not self._climbing and not directed:
-            eigs_dir, vecs_dir = self._get_directed_modes(B, pos_1D)
-            self._climbing = self._is_climbing(vecs_dir[:, 0], g, dxi, dxf)
-            if self._climbing:
-                eigs_tmp, vecs_tmp = eigs_dir, vecs_dir
+            B_dir, u = self._get_directed_hessian(B, pos_1D)
+            if self._is_climbing(u, g, dxi, dxf):
+                B_opt, v, self._climbing = B_dir, u, True
         if not self._climbing:
-            eigs_tmp, vecs_tmp = eigs_B.copy(), vecs_B.copy()
-
-        for i, eig in enumerate(eigs_tmp):
-            if i == 0 and self._climbing:
-                eigs_tmp[i] = - np.abs(eig)
-            else:
-                eigs_tmp[i] = np.abs(eig)
-        Dmat = np.diag(eigs_tmp)
-        B_opt = mult(vecs_tmp, mult(Dmat, vecs_tmp.T))
+            B_opt, v = B, vecs_B[:, 0]
+        self._climb_mode = v
         return B_opt
 
     def _get_maxstep(self, dx_1D: np.ndarray) -> float:
@@ -174,16 +194,6 @@ class SaddleClimb:
         and the same reduction ``Fmax`` uses for forces.
         """
         return LA.norm(dx_1D.reshape(-1, 3), axis=1).max()
-
-    def _get_newton_step(self, B_opt, g):
-
-        inv_B_temp = LA.inv(B_opt)
-        dx_1D = -mult(inv_B_temp, g)
-        stepsize = self._get_maxstep(dx_1D)
-        if stepsize > self.maxstep:
-            dx_1D *= self.maxstep / stepsize
-
-        return dx_1D
 
     def _get_scaled_climb_step(self, B_opt, g, vmax, a):
         """
@@ -254,19 +264,18 @@ class SaddleClimb:
 
     def _get_pfro_step(self, B_opt, g, a=None):
         """
-        Partitioned RFO step.  One scaling is solved for the whole
-        step against the single trust radius ``maxstep``, with the
-        climb partition taking ``a_climb_mult`` times the descent
-        scaling.  Both partitions therefore move together, and the
-        multiplier sets how the fixed step length is divided
-        between climbing and relaxing.  With an explicit ``a`` the
+        Partitioned RFO step: maximized along ``_climb_mode``, minimized
+        in the space across it.  One scaling is solved for the whole
+        step against the single trust radius ``maxstep``, and both
+        partitions use it.  With an explicit ``a`` the
         search is skipped.  The linear truncation is kept as a
         safety net: the bracket is closed only to ``xtol`` in
         log(a), and for the case where no bracket could be found
         at all.
         """
-        _, vecs = LA.eigh(B_opt)
-        vmin, vmax = vecs[:, 1:], vecs[:, 0]
+        vmax = self._climb_mode
+        basis, _ = LA.qr(vmax.reshape(-1, 1), mode='complete')
+        vmin = basis[:, 1:]
 
         def climb(scale):
             return self._get_scaled_climb_step(B_opt, g, vmax, scale)
@@ -275,7 +284,7 @@ class SaddleClimb:
             return self._get_scaled_descend_step(B_opt, g, vmin, scale)
 
         def total(scale):
-            return climb(self.a_climb_mult * scale) + descend(scale)
+            return climb(scale) + descend(scale)
 
         scale = (a if a is not None
                  else self._get_pfro_scaling(total, self.maxstep))
@@ -286,12 +295,8 @@ class SaddleClimb:
         return step
 
     def _get_step(self, B_opt, g):
-        """Step from the modified Hessian, by whichever method is set."""
-        if self.method == 'pfro':
-            return self._get_pfro_step(B_opt, g)
-        elif self.method == 'newton':
-            return self._get_newton_step(B_opt, g)
-        raise ValueError(f'unknown method {self.method!r}')
+        """P-RFO step from the decoupled Hessian."""
+        return self._get_pfro_step(B_opt, g)
 
     def _update_hessian(
             self: None, B_old: np.ndarray,
@@ -364,11 +369,7 @@ class SaddleClimb:
             ) -> tuple[np.ndarray, np.ndarray]:
         self._pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
         self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
-        dx_1D = self._pos_f_1D - self._pos_i_1D
-        if self.target_indices:
-            for i in range(len(self.indices)):
-                if i not in self.sub_target_indices:
-                    dx_1D[3*i:3*i+3] = 0
+        dx_1D = self._hold_non_targets(self._pos_f_1D - self._pos_i_1D)
         # Held atoms are zeroed first, so delta0 is the length
         # of the step actually taken, in the same units as the
         # trust radii.
@@ -419,7 +420,8 @@ class SaddleClimb:
             self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
             pos_1D = atoms.positions[idx, :].reshape(-1)
             dxi = self._get_maxstep(self._pos_i_1D - pos_1D)
-            self._step_count = n
+            self._negative_streak = self._restart_trajectory.info.get(
+                'saddleclimb_negative_streak', 0)
             B_opt = self._get_B_opt(B, g, pos_1D)
             dx_1D = self._get_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
@@ -439,7 +441,7 @@ class SaddleClimb:
             dg = g - g0
             Fmax = LA.norm(-g.reshape(-1, 3), axis=1).max()
             B = self._update_hessian(B, dg, dx_1D)
-            self._step_count = n
+            self._update_negative_streak(B)
             B_opt = self._get_B_opt(B, g, pos_1D)
             dx_1D = self._get_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
@@ -449,6 +451,7 @@ class SaddleClimb:
             atoms.info["saddleclimb_hessian"] = B.tolist()
             atoms.info["saddleclimb_hessian_shape"] = B.shape
             atoms.info['saddleclimb_iterations'] = n + 0
+            atoms.info['saddleclimb_negative_streak'] = self._negative_streak
             image = atoms.copy()
             image.calc = SinglePointCalculator(image, energy=E, forces=f)
             traj.write(image)
@@ -470,17 +473,32 @@ class SaddleClimb:
         p_m = self._get_path_coordinate(pos)
         f_minus = max(p_m - self.delta_f, 0)
         f_plus = min(p_m + self.delta_f, 1)
-        pos_minus = self.get_positions_from_distances(
-            self.get_qst_distances(pos, f_minus), pos, self.indices)
-        pos_plus = self.get_positions_from_distances(
-            self.get_qst_distances(pos, f_plus), pos, self.indices)
-        return (pos_plus - pos_minus)[self.indices, :].reshape(-1)
+        return (self._get_qst_positions(pos, f_plus)
+                - self._get_qst_positions(pos, f_minus))
+
+    def _get_qst_positions(self, pos, f):
+        """
+        Moving-atom positions at ``f`` on the QST path through pos.
+
+        Only the bias atoms are fitted to the interpolated distances.
+        Every other atom is held where it is in ``pos``, so it still
+        shapes the fit through its pairs with the bias atoms but does
+        not move.
+        """
+        pos_f = self.get_positions_from_distances(
+            self.get_qst_distances(pos, f), pos, self._bias_atoms)
+        return pos_f[self.indices, :].reshape(-1)
 
     def _get_path_coordinate(self, positions: np.ndarray) -> float:
-        """Path coordinate p of a structure, eqs. (4) and (5)."""
-        norm = np.sqrt(len(positions))
-        d_R = LA.norm(positions - self.atoms_initial.positions) / norm
-        d_P = LA.norm(positions - self.atoms_final.positions) / norm
+        """
+        Path coordinate p of a structure, eqs. (4) and (5).
+
+        Measured over the bias atoms only, so relaxation of atoms
+        outside ``target_indices`` does not move p along the path.
+        """
+        atoms = self._bias_atoms
+        d_R = LA.norm(positions[atoms] - self.atoms_initial.positions[atoms])
+        d_P = LA.norm(positions[atoms] - self.atoms_final.positions[atoms])
         return d_R / (d_R + d_P)
 
     def get_qst_distances(self, positions: np.ndarray,
