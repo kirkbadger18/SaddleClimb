@@ -1,13 +1,15 @@
 # SaddleClimb:
-## A path-biased minimum-mode-following saddle-point search algorithm
+## A path-biased saddle-point search algorithm
 
 This method combines the advantages of both single- and double-ended search methods for finding first-order saddle points that connect
-reactive intermediates to one another. At the start of the optimization, the atoms corresponding to an initial state are slowly stepped uphill in the direction of the average path. The average path is the difference between the final state and the initial state. At each step, an approximate Hessian is updated using the TS-BFGS method. Once one of the eigenvectors switches to being negative (and stays negative for at least 3 steps), the rest of the optimization is done via partitioned rational-function optimization. This seems to work over a wide range of surface reactions from dissociation, abstraction, vdW dissociation. It seems to take somewhere between 20-100 gradient calls from an electronic structure calculator to achieve convergence of 0.01 eV/Å. In comparison a NEB with 7 intermediate images might need 7×300 = 2100 gradient calls. Please test this out and let me know if it also works for you all.
+reactive intermediates to one another. At the start of the optimization, the atoms corresponding to the reactant undergo a small step towards the products in Cartesian space. An approximate Hessian, which is initialized as a scaled identity matrix, is updated using the TS-BFGS method (Bofill method). Next, one of two step types is taken: either a directed step is taken, or a free-climbing step is taken. A free-climbing step is one that takes a partitioned-rational function optimization step (P-RFO) which uses the lowest eigenvector of the approximate Hessian as the climbing direction. A directed-climb step first requires constructing a new basis with the desired climbing direction as the leftmost entry. The approximate Hessian is mapped into this basis, and the coupling terms between the climbing direction and descent direction are nulled out. Then the modified Hessian is mapped back to Cartesian coordinates, and a P-RFO step is taken using the eigenvectors of the modified hessian. Directed steps are taken early on in the climb, and the direction in which to climb is determined by an estimate of the direction of the path. The two supported path estimation types are linear and quadratic synchronous transit (qst). Once one of the eigenvectors of the unmodified Hessian switches to being negative (and stays negative for at least 5 steps), the method switches to taking free-climbing steps. If the negative mode becomes positive again, the method switches back to directed steps and resets the counter.
+
+This seems to work over a wide range of surface reactions suc dissociation, abstraction, vdW dissociation. It seems to take somewhere between 20-100 gradient calls from an electronic structure calculator to achieve convergence of 0.01 eV/Å. In comparison a NEB with 7 intermediate images might need 8×200 = 1600 gradient calls. Please test this out and let me know if it also works for you all.
 
 ## Installation
 If you intend to use this method, but not work on it, you can simply pip install the latest stable version. First activate your virtual environment of choice (venv, conda ...), then pip install:
 
-`pip install git+https://github.com/kirkbadger18/SaddleClimb.git@v0.2.0`
+`pip install git+https://github.com/kirkbadger18/SaddleClimb.git@v0.3.0`
 
 If you want to install the developer version, first clone this repository:
 
