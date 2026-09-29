@@ -27,7 +27,7 @@ class SaddleClimb:
 
             delta0: float = 0.1,
             hessian_scale: float = 20,
-            min_negative_streak: int = 5,
+            min_directed_steps: int = 5,
             maxstep: float = 0.2,
 
             min_travel: float = 0.1,
@@ -47,18 +47,19 @@ class SaddleClimb:
         self.maxstep = maxstep
         self.min_travel = min_travel
         self.hessian_scale = hessian_scale
-        if not min_negative_streak >= 1:
-            raise ValueError('min_negative_streak must be at least 1, '
-                             f'got {min_negative_streak}')
-        self.min_negative_streak = min_negative_streak
+        if not min_directed_steps >= 0:
+            raise ValueError('min_directed_steps must not be negative, '
+                             f'got {min_directed_steps}')
+        self.min_directed_steps = min_directed_steps
         self.a_max = a_max
         self.max_scaling_halvings = max_scaling_halvings
         self.delta = delta0
         self.logfile = logfile
         self.trajfile = trajfile
         self._restart = False
-        self._climbing = True
-        self._negative_streak = 0
+        self._reference_mode = None
+        self._free = False
+        self._step_count = 0
         self._get_moving_atoms()
         if self.target_indices:
             self._get_sub_target_atoms()
@@ -142,16 +143,13 @@ class SaddleClimb:
         return not (np.dot(ascent_dir, dxi) < 0
                     and np.dot(ascent_dir, dxf) < 0)
 
-    def _update_negative_streak(self, B):
-        """Count consecutive Hessian updates whose lowest mode is negative."""
-        if LA.eigvalsh(B)[0] < 0:
-            self._negative_streak += 1
-        else:
-            self._negative_streak = 0
-
-    def _is_directed(self):
-        """Steer by the bias until B's negative mode has persisted."""
-        return self._negative_streak < self.min_negative_streak
+    def _is_directed(self, lowest):
+        """
+        Steer by the bias for the first ``min_directed_steps`` steps,
+        and after that while B's lowest eigenvalue ``lowest`` is
+        non-negative.
+        """
+        return self._step_count < self.min_directed_steps or lowest >= 0
 
     def _get_B_opt(self, B, g, pos_1D):
         """
@@ -160,29 +158,45 @@ class SaddleClimb:
         No eigenvalue signs are changed: P-RFO imposes the saddle shape
         itself by taking the highest root along the climb mode and the
         lowest across it, and it climbs a convex mode only if it sees
-        that mode's true, positive curvature.  While directed, the bias
-        is decoupled from the rest of B and climbed; once free, the
-        lowest mode of B is climbed.  The guard falls back to the bias
-        when the free mode leads away from both ends, and clears
-        ``_climbing`` if neither climbs.  The climb mode is stored in
+        that mode's true, positive curvature.  After the first
+        ``min_directed_steps`` steps, a step is free when B's lowest
+        eigenvalue is negative, and then climbs B's lowest mode;
+        otherwise it is directed, and the bias is decoupled from the rest
+        of B and climbed.  If the previous step was also free, a
+        would-be free step checks that B's lowest mode is still the
+        eigenvector overlapping most with the previous climb direction.
+        If another eigenvector overlaps more and its eigenvalue is
+        negative, that mode is climbed instead; if its eigenvalue is
+        non-negative, the step drops back to the bias.  After a biased
+        step there is nothing to compare, and B's lowest mode is
+        climbed.  Overlaps are taken in absolute value, so eigenvector
+        signs do not matter.  A free step whose uphill direction leads
+        away from both ends also falls back to the bias.  Either guard
+        affects only the step it trips on.  Bias steps are never guarded,
+        so the climb is never nulled.  The climb mode is stored in
         ``_climb_mode``.
         """
         dxi = self._pos_i_1D - pos_1D
         dxf = self._pos_f_1D - pos_1D
         eigs_B, vecs_B = LA.eigh(B)
-        directed = self._is_directed()
-        if directed:
-            B_opt, v = self._get_directed_hessian(B, pos_1D)
+        lowest = vecs_B[:, 0]
+        free = not self._is_directed(eigs_B[0])
+        followed = lowest
+        if free and self._reference_mode is not None:
+            k = np.argmax(np.abs(vecs_B.T @ self._reference_mode))
+            if eigs_B[k] < 0:
+                followed = vecs_B[:, k]
+            else:
+                free = False
+        if free:
+            free = self._is_climbing(followed, g, dxi, dxf)
+        if free:
+            B_opt, v = B, followed
         else:
-            B_opt, v = B, vecs_B[:, 0]
-        self._climbing = self._is_climbing(v, g, dxi, dxf)
-        if not self._climbing and not directed:
-            B_dir, u = self._get_directed_hessian(B, pos_1D)
-            if self._is_climbing(u, g, dxi, dxf):
-                B_opt, v, self._climbing = B_dir, u, True
-        if not self._climbing:
-            B_opt, v = B, vecs_B[:, 0]
+            B_opt, v = self._get_directed_hessian(B, pos_1D)
         self._climb_mode = v
+        self._reference_mode = v if free else None
+        self._free = free
         return B_opt
 
     def _get_maxstep(self, dx_1D: np.ndarray) -> float:
@@ -198,14 +212,7 @@ class SaddleClimb:
     def _get_scaled_climb_step(self, B_opt, g, vmax, a):
         """
         Climb component of the P-RFO step, maximised along ``vmax``.
-
-        When the guard has cleared ``_climbing`` this component is
-        nulled rather than descended: climb and descent would otherwise
-        be the same mode pulling opposite ways, and what is left
-        relaxes everything perpendicular to it.
         """
-        if not self._climbing:
-            return np.zeros_like(g)
         climb_M = np.array([
             [a**2*mult(vmax.T, mult(B_opt, vmax)), a*mult(vmax.T, g)],
             [a*mult(g.T, vmax), 0]
@@ -265,13 +272,12 @@ class SaddleClimb:
     def _get_pfro_step(self, B_opt, g, a=None):
         """
         Partitioned RFO step: maximized along ``_climb_mode``, minimized
-        in the space across it.  One scaling is solved for the whole
-        step against the single trust radius ``maxstep``, and both
-        partitions use it.  With an explicit ``a`` the
-        search is skipped.  The linear truncation is kept as a
-        safety net: the bracket is closed only to ``xtol`` in
-        log(a), and for the case where no bracket could be found
-        at all.
+        in the space across it.  Each partition gets its own scaling,
+        solved separately so that its component alone stays within
+        ``maxstep``.  The two components are summed and the sum is
+        truncated linearly back to ``maxstep`` if it exceeds it.  With
+        an explicit ``a`` both searches are skipped and ``a`` is used
+        for both partitions.
         """
         vmax = self._climb_mode
         basis, _ = LA.qr(vmax.reshape(-1, 1), mode='complete')
@@ -283,12 +289,12 @@ class SaddleClimb:
         def descend(scale):
             return self._get_scaled_descend_step(B_opt, g, vmin, scale)
 
-        def total(scale):
-            return climb(scale) + descend(scale)
-
-        scale = (a if a is not None
-                 else self._get_pfro_scaling(total, self.maxstep))
-        step = total(scale)
+        if a is not None:
+            a_climb = a_descend = a
+        else:
+            a_climb = self._get_pfro_scaling(climb, self.maxstep)
+            a_descend = self._get_pfro_scaling(descend, self.maxstep)
+        step = climb(a_climb) + descend(a_descend)
         stepsize = self._get_maxstep(step)
         if stepsize > self.maxstep:
             step = step * (self.maxstep / stepsize)
@@ -420,8 +426,10 @@ class SaddleClimb:
             self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
             pos_1D = atoms.positions[idx, :].reshape(-1)
             dxi = self._get_maxstep(self._pos_i_1D - pos_1D)
-            self._negative_streak = self._restart_trajectory.info.get(
-                'saddleclimb_negative_streak', 0)
+            last = self._restart_trajectory.info.get(
+                'saddleclimb_reference_mode')
+            self._reference_mode = None if last is None else np.array(last)
+            self._step_count = n
             B_opt = self._get_B_opt(B, g, pos_1D)
             dx_1D = self._get_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
@@ -441,7 +449,8 @@ class SaddleClimb:
             dg = g - g0
             Fmax = LA.norm(-g.reshape(-1, 3), axis=1).max()
             B = self._update_hessian(B, dg, dx_1D)
-            self._update_negative_streak(B)
+            self._step_count = n
+            reference_mode = self._reference_mode
             B_opt = self._get_B_opt(B, g, pos_1D)
             dx_1D = self._get_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
@@ -451,7 +460,9 @@ class SaddleClimb:
             atoms.info["saddleclimb_hessian"] = B.tolist()
             atoms.info["saddleclimb_hessian_shape"] = B.shape
             atoms.info['saddleclimb_iterations'] = n + 0
-            atoms.info['saddleclimb_negative_streak'] = self._negative_streak
+            atoms.info['saddleclimb_reference_mode'] = (
+                None if reference_mode is None
+                else reference_mode.tolist())
             image = atoms.copy()
             image.calc = SinglePointCalculator(image, energy=E, forces=f)
             traj.write(image)
