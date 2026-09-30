@@ -27,7 +27,8 @@ class SaddleClimb:
 
             delta0: float = 0.1,
             hessian_scale: float = 20,
-            min_directed_steps: int = 5,
+            min_directed_steps: int = 10,
+            free_eig_ceiling: float = -0.1,
             maxstep: float = 0.2,
 
             min_travel: float = 0.1,
@@ -51,6 +52,10 @@ class SaddleClimb:
             raise ValueError('min_directed_steps must not be negative, '
                              f'got {min_directed_steps}')
         self.min_directed_steps = min_directed_steps
+        if not free_eig_ceiling <= 0:
+            raise ValueError('free_eig_ceiling must not be positive, '
+                             f'got {free_eig_ceiling}')
+        self.free_eig_ceiling = free_eig_ceiling
         self.a_max = a_max
         self.max_scaling_halvings = max_scaling_halvings
         self.delta = delta0
@@ -146,10 +151,12 @@ class SaddleClimb:
     def _is_directed(self, lowest):
         """
         Steer by the bias for the first ``min_directed_steps`` steps,
-        and after that while B's lowest eigenvalue ``lowest`` is
-        non-negative.
+        and after that until B's lowest eigenvalue ``lowest`` is below
+        ``free_eig_ceiling``, so near-zero negative eigenvalues do not
+        trigger a free climb.
         """
-        return self._step_count < self.min_directed_steps or lowest >= 0
+        return (self._step_count < self.min_directed_steps
+                or lowest >= self.free_eig_ceiling)
 
     def _get_B_opt(self, B, g, pos_1D):
         """
@@ -160,9 +167,9 @@ class SaddleClimb:
         lowest across it, and it climbs a convex mode only if it sees
         that mode's true, positive curvature.  After the first
         ``min_directed_steps`` steps, a step is free when B's lowest
-        eigenvalue is negative, and then climbs B's lowest mode;
-        otherwise it is directed, and the bias is decoupled from the rest
-        of B and climbed.  If the previous step was also free, a
+        eigenvalue is below ``free_eig_ceiling``, and then climbs B's
+        lowest mode; otherwise it is directed, and the bias is
+        decoupled from the rest of B and climbed.  If the previous step was also free, a
         would-be free step checks that B's lowest mode is still the
         eigenvector overlapping most with the previous climb direction.
         If another eigenvector overlaps more and its eigenvalue is

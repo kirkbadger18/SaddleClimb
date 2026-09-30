@@ -336,20 +336,22 @@ def test_target_indices_set_the_qst_bias():
         SaddleClimb(init, final, EMT(), target_indices=[0])
 
 
-def test_directed_for_min_steps_then_follows_lowest_sign():
+def test_directed_for_min_steps_then_follows_eig_ceiling():
     """The first min_directed_steps steps are directed whatever B says.
 
     After that a step is directed while B's lowest eigenvalue is
-    non-negative and free while it is negative, switching back and
-    forth with the sign.
+    at or above free_eig_ceiling and free while it is below it,
+    switching back and forth.
     """
     climber = generate_saddleclimb_object()
     climber.min_directed_steps = 2
+    climber.free_eig_ceiling = -0.1
     directed = []
-    for step, lowest in enumerate((-1, -1, -1, 0, 2, -1e-6, 1)):
+    for step, lowest in enumerate((-1, -1, -1, 0, 2, -0.05, -0.1, -0.11, 1)):
         climber._step_count = step
         directed.append(climber._is_directed(lowest))
-    assert directed == [True, True, False, True, True, False, True]
+    assert directed == [True, True, False, True, True, True, True, False,
+                        True]
 
 def test_free_climb_follows_negative_mode_or_drops_to_bias():
     """After a free step, the mode overlapping most with its climb
