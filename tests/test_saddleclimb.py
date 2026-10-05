@@ -233,11 +233,11 @@ def test_guard_falls_back_to_bias_and_never_nulls(directed):
     """A free step failing the guard climbs the bias instead; bias steps
     are not guarded at all.
 
-    B's lowest mode w is not the bias, and ascent along the bias and
-    along w both lead away from both endpoints.  Free, w fails the guard
-    and the step falls back to the bias; directed, the bias is climbed
-    unguarded.  Either way the bias is the climb mode and the step still
-    has a component along it.
+    Ascent along the bias and along w both lead away from both
+    endpoints.  Free (the bias mode is negative), the climbed mode fails
+    the guard and the step falls back to the bias; directed, the bias is
+    climbed unguarded.  Either way the bias is the climb mode and the
+    step still has a component along it.
     """
     climber = generate_saddleclimb_object()
     idx = climber.indices
@@ -249,7 +249,7 @@ def test_guard_falls_back_to_bias_and_never_nulls(directed):
     basis, _ = LA.qr(dhat.reshape(n, 1), mode='complete')
     w = basis[:, 1]
     eigs = np.full(n, 10.0)
-    eigs[0], eigs[1] = 5.0, (1.0 if directed else -1.0)
+    eigs[0], eigs[1] = (5.0 if directed else -5.0), 1.0
     B = basis @ np.diag(eigs) @ basis.T
     climber._step_count = (0 if directed
                            else climber.min_directed_steps)
@@ -336,82 +336,6 @@ def test_target_indices_set_the_qst_bias():
         SaddleClimb(init, final, EMT(), target_indices=[0])
 
 
-def test_directed_for_min_steps_then_follows_eig_ceiling():
-    """The first min_directed_steps steps are directed whatever B says.
-
-    After that a step is directed while B's lowest eigenvalue is
-    at or above free_eig_ceiling and free while it is below it,
-    switching back and forth.
-    """
-    climber = generate_saddleclimb_object()
-    climber.min_directed_steps = 2
-    climber.free_eig_ceiling = -0.1
-    directed = []
-    for step, lowest in enumerate((-1, -1, -1, 0, 2, -0.05, -0.1, -0.11, 1)):
-        climber._step_count = step
-        directed.append(climber._is_directed(lowest))
-    assert directed == [True, True, False, True, True, True, True, False,
-                        True]
-
-def test_free_climb_follows_negative_mode_or_drops_to_bias():
-    """After a free step, the mode overlapping most with its climb
-    direction is followed if negative, else the step uses the bias.
-
-    After a biased step there is nothing to compare, and B's lowest
-    mode is climbed.  Eigenvector signs do not matter.
-
-    step  B's two softest modes (eigenvalues)    result
-    1     b0, b1 (-1, 0.5)                       free, b0
-    2     b1, b0 (-1, 0.5)                       bias: b0 matches the positive mode
-    3     b1, b0 (-1, 0.5)                       free, b1 (previous step biased)
-    4     p40, p130 (-1, 0.5)                    free, p40 (still the best match)
-    5     p100, p190 (-1, 0.5)                   bias: p190 matches p40 better, positive
-    6     p100, p190 (0.2, 0.5)                  bias (latch)
-    7     p100, p190 (-1, 0.5)                   free, p100 (previous step biased)
-    8     p190, p100 (-2, -1)                    free, p100: best match, negative
-    9     p190, p100 (-2, -1)                    free, p100 again
-    10    p190, p100 (-2, 0.5)                   bias: p100 now positive
-    """
-    climber = generate_saddleclimb_object()
-    climber._step_count = climber.min_directed_steps
-    idx = climber.indices
-    n = 3 * len(idx)
-    climber._pos_i_1D = climber.atoms_initial.positions[idx, :].reshape(-1)
-    climber._pos_f_1D = climber.atoms_final.positions[idx, :].reshape(-1)
-    pos_1D = 0.5 * (climber._pos_i_1D + climber._pos_f_1D)
-    dhat = climber.normalize(climber._pos_f_1D - climber._pos_i_1D)
-    basis, _ = LA.qr(dhat.reshape(n, 1), mode='complete')
-    b0, b1 = basis[:, 1], basis[:, 2]
-
-    def hessian(first, second, eig1=-1.0, eig2=0.5):
-        """First and second eigenvectors given; the rest stiff."""
-        vecs, _ = LA.qr(np.column_stack([first, second]), mode='complete')
-        eigs = np.concatenate(([eig1, eig2], np.full(n - 2, 5.0)))
-        return vecs @ np.diag(eigs) @ vecs.T
-
-    def p(deg):
-        """Unit vector at deg from b1 towards b0, across the chord."""
-        t = np.radians(deg)
-        return np.cos(t) * b1 + np.sin(t) * b0
-
-    steps = [(hessian(b0, b1), b0),
-             (hessian(-b1, b0), None),
-             (hessian(b1, -b0), b1),
-             (hessian(p(40), p(130)), p(40)),
-             (hessian(p(100), p(190)), None),
-             (hessian(p(100), p(190), eig1=0.2), None),
-             (hessian(-p(100), p(190)), p(100)),
-             (hessian(p(190), p(100), eig1=-2.0, eig2=-1.0), p(100)),
-             (hessian(p(190), -p(100), eig1=-2.0, eig2=-1.0), p(100)),
-             (hessian(p(190), p(100), eig1=-2.0), None)]
-    for k, (B, climbed) in enumerate(steps):
-        g = (-1) ** k * 0.3 * LA.eigh(B)[1][:, 0]
-        climber._get_B_opt(B, g, pos_1D)
-        assert climber._free == (climbed is not None), k + 1
-        if climbed is not None:
-            assert_allclose(abs(np.dot(climber._climb_mode, climbed)), 1,
-                            atol=1e-10)
-
 def test_tripped_guard_is_a_one_off():
     """A tripped guard biases only the step it trips on.
 
@@ -428,15 +352,17 @@ def test_tripped_guard_is_a_one_off():
     basis, _ = LA.qr(dhat.reshape(n, 1), mode='complete')
     w = basis[:, 1]
     eigs = np.full(n, 10.0)
-    eigs[0], eigs[1] = 5.0, -1.0
+    eigs[0] = -5.0
     B = basis @ np.diag(eigs) @ basis.T
 
-    # Ascent along +w leads away from both ends here, so it trips.
+    # Past the final endpoint, ascent along +dhat leads away from both
+    # ends, so it trips.
     far = climber._pos_i_1D + 1.3 * chord + 0.5 * w
     mid = climber._pos_i_1D + 0.5 * chord
     free = []
-    for pos_1D, g in [(mid, 0.3 * w), (far, 0.5 * dhat + 0.3 * w),
-                      (mid, 0.3 * w), (mid, 0.3 * w)]:
+    for pos_1D, g in [(mid, 0.1 * dhat + 0.3 * w), (far, 0.5 * dhat + 0.3 * w),
+                      (mid, 0.1 * dhat + 0.3 * w),
+                      (mid, 0.1 * dhat + 0.3 * w)]:
         climber._get_B_opt(B, g, pos_1D)
         free.append(climber._free)
     assert free == [True, False, True, True]
