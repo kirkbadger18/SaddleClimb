@@ -25,10 +25,10 @@ class SaddleClimb:
             trajfile: str = 'climb.traj',
             interp: str = 'qst',
 
-            delta0: float = 0.05,
+            delta0: float = 0.1,
             hessian_scale: float = 10,
-            min_directed_steps: int = 10,
-            maxstep: float = 0.15,
+            min_directed_steps: int = 6,
+            maxstep: float = 0.2,
 
             min_travel: float = 0.1,
             a_max: float = 1,
@@ -271,12 +271,13 @@ class SaddleClimb:
     def _get_pfro_step(self, B_opt, g, a=None):
         """
         Partitioned RFO step: maximized along ``_climb_mode``, minimized
-        in the space across it.  Each partition gets its own scaling,
-        solved separately so that its component alone stays within
-        ``maxstep``.  The two components are summed and the sum is
-        truncated linearly back to ``maxstep`` if it exceeds it.  With
-        an explicit ``a`` both searches are skipped and ``a`` is used
-        for both partitions.
+        in the space across it.  One scaling is solved for the whole
+        step against the single trust radius ``maxstep``, and both
+        partitions use it.  With an explicit ``a`` the
+        search is skipped.  The linear truncation is kept as a
+        safety net: the bracket is closed only to ``xtol`` in
+        log(a), and for the case where no bracket could be found
+        at all.
         """
         vmax = self._climb_mode
         basis, _ = LA.qr(vmax.reshape(-1, 1), mode='complete')
@@ -288,12 +289,12 @@ class SaddleClimb:
         def descend(scale):
             return self._get_scaled_descend_step(B_opt, g, vmin, scale)
 
-        if a is not None:
-            a_climb = a_descend = a
-        else:
-            a_climb = self._get_pfro_scaling(climb, self.maxstep)
-            a_descend = self._get_pfro_scaling(descend, self.maxstep)
-        step = climb(a_climb) + descend(a_descend)
+        def total(scale):
+            return climb(scale) + descend(scale)
+
+        scale = (a if a is not None
+                 else self._get_pfro_scaling(total, self.maxstep))
+        step = total(scale)
         stepsize = self._get_maxstep(step)
         if stepsize > self.maxstep:
             step = step * (self.maxstep / stepsize)

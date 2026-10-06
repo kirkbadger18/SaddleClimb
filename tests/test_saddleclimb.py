@@ -144,13 +144,13 @@ def test_initialize_atoms():
     assert_allclose(climber.hessian, B_test)
 
 
-def test_pfro_scales_climb_and_descent_separately():
-    """Each partition is scaled against maxstep on its own.
+def test_pfro_uses_one_scaling_for_climb_and_descent():
+    """One scaling is solved on the whole step and both parts use it.
 
-    A soft climb mode with a large gradient along it has to be scaled
-    down, while a small descent fits unscaled at a_max.  The descent
-    must therefore not be shortened by the climb's scaling, only by the
-    final truncation of the sum, which scales both parts equally.
+    A soft climb mode with a large gradient along it forces the scaling
+    below a_max, and the descent, which would fit unscaled, is scaled
+    down with it.  The step is the sum of both parts at that one scaling
+    and reaches maxstep.
     """
     climber = generate_saddleclimb_object()
     rng = np.random.default_rng(3)
@@ -170,17 +170,17 @@ def test_pfro_scales_climb_and_descent_separately():
 
     assert climber._get_maxstep(climb(climber.a_max)) > climber.maxstep
     assert climber._get_maxstep(descend(climber.a_max)) < climber.maxstep
-    a_climb = climber._get_pfro_scaling(climb, climber.maxstep)
-    assert a_climb < climber.a_max
-    assert_allclose(climber._get_maxstep(climb(a_climb)), climber.maxstep,
-                    rtol=1e-2)
+    a = climber._get_pfro_scaling(lambda s: climb(s) + descend(s),
+                                  climber.maxstep)
+    assert a < climber.a_max
 
     step = climber._get_pfro_step(B_opt, g)
+    assert_allclose(climber._get_maxstep(step), climber.maxstep, rtol=1e-2)
     assert climber._get_maxstep(step) <= climber.maxstep + 1e-9
-    f = np.dot(step, vmax) / np.dot(climb(a_climb), vmax)
-    assert 0 < f <= 1 + 1e-12
+    assert_allclose(step, climb(a) + descend(a), rtol=1e-2, atol=1e-3)
     across = step - np.dot(step, vmax) * vmax
-    assert_allclose(across, f * descend(climber.a_max), atol=1e-12)
+    assert climber._get_maxstep(across) < climber._get_maxstep(
+        descend(climber.a_max))
 
 
 def test_climb_guard_reads_ascent_direction_not_gradient():
