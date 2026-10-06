@@ -25,10 +25,10 @@ class SaddleClimb:
             trajfile: str = 'climb.traj',
             interp: str = 'qst',
 
-            delta0: float = 0.1,
+            delta0: float = 0.05,
             hessian_scale: float = 10,
-            min_directed_steps: int = 6,
-            maxstep: float = 0.2,
+            min_directed_steps: int = 10,
+            maxstep: float = 0.15,
 
             min_travel: float = 0.1,
             a_max: float = 1,
@@ -59,6 +59,8 @@ class SaddleClimb:
         self._restart = False
         self._free = False
         self._step_count = 0
+        self._prev_mode = None
+        self._prev_eig = None
         self._get_moving_atoms()
         if self.target_indices:
             self._get_sub_target_atoms()
@@ -142,6 +144,19 @@ class SaddleClimb:
         return not (np.dot(ascent_dir, dxi) < 0
                     and np.dot(ascent_dir, dxf) < 0)
 
+    def _is_tracked_mode(self, vecs):
+        """True if the last lowest mode was negative and tracks the lowest.
+
+        The last step's lowest eigenvector is dotted with each current
+        eigenvector, and the largest absolute dot product must belong
+        to the lowest one, so eigenvector signs do not matter.  False
+        when there is no previous B yet or its lowest eigenvalue was not
+        negative.
+        """
+        if self._prev_mode is None or self._prev_eig >= 0:
+            return False
+        return np.argmax(np.abs(vecs.T @ self._prev_mode)) == 0
+
     def _get_B_opt(self, B, g, pos_1D):
         """
         Hessian handed to P-RFO, and the mode it climbs.
@@ -150,40 +165,35 @@ class SaddleClimb:
         itself by taking the highest root along the climb mode and the
         lowest across it, and it climbs a convex mode only if it sees
         that mode's true, positive curvature.  The first
-        ``min_directed_steps`` steps are directed: the bias is
-        decoupled from the rest of B and climbed.  After that, the
-        bias and every eigenvector of B are pointed along the chord from
-        the initial to the final structure (positive dot product with
-        it), so the signs do not depend on the gradient, which is noise
-        near a stationary point.  A step is free only if B's lowest
-        eigenvector has a negative eigenvalue and a positive dot
-        product with the bias, however many other eigenvectors lie
-        closer to it; B is used as it is, and the lowest mode is the
-        only mode ever climbed besides the bias.  Otherwise the step is
-        directed.  A free step
-        whose uphill direction leads away from both ends also falls back
-        to the bias.  The guard affects only the step it trips on, and
-        a tripped guard climbs the bias, it never zeroes the step, and
-        bias steps are never guarded.  The climb mode is stored in ``_climb_mode``.
+        ``min_directed_steps`` steps are always directed.  After that a
+        step is free when B's lowest eigenvalue is negative and its lowest
+        eigenvector is the one with the largest overlap with the lowest
+        eigenvector of the previous step's B, whose eigenvalue was also
+        negative.  B is then used as it is and its lowest mode is
+        climbed.  Otherwise, including the first step, which has
+        no previous B, the step is directed: the bias is decoupled from
+        the rest of B and climbed.  A free step whose uphill direction
+        leads away from both ends also falls back to the bias.  The
+        guard affects only the step it trips on, a tripped guard climbs
+        the bias and never zeroes the step, and bias steps are never
+        guarded.  The climb mode is stored in ``_climb_mode``.
         """
         dxi = self._pos_i_1D - pos_1D
         dxf = self._pos_f_1D - pos_1D
-        bias = self._get_bias_vector(pos_1D)
-        bias = bias / LA.norm(bias)
-        free = self._step_count >= self.min_directed_steps
-        if free:
-            eigs_B, vecs_B = LA.eigh(B)
-            chord = self._hold_non_targets(self._pos_f_1D - self._pos_i_1D)
-            vecs_B = vecs_B * np.where(chord @ vecs_B >= 0, 1.0, -1.0)
-            bias = bias if chord @ bias >= 0 else -bias
-            free = eigs_B[0] < 0 and vecs_B[:, 0] @ bias > 0
+        eigs_B, vecs_B = LA.eigh(B)
+        free = (self._step_count >= self.min_directed_steps
+                and eigs_B[0] < 0
+                and self._is_tracked_mode(vecs_B))
+        self._prev_mode = vecs_B[:, 0]
+        self._prev_eig = eigs_B[0]
         if free:
             followed = vecs_B[:, 0]
             free = self._is_climbing(followed, g, dxi, dxf)
         if free:
             B_opt, v = B, followed
         else:
-            B_opt, v = self._get_directed_hessian(B, bias)
+            bias = self._get_bias_vector(pos_1D)
+            B_opt, v = self._get_directed_hessian(B, bias / LA.norm(bias))
         self._climb_mode = v
         self._free = free
         return B_opt
@@ -416,6 +426,10 @@ class SaddleClimb:
             pos_1D = atoms.positions[idx, :].reshape(-1)
             dxi = self._get_maxstep(self._pos_i_1D - pos_1D)
             self._step_count = n
+            prev = self._restart_trajectory.info.get('saddleclimb_prev_mode')
+            self._prev_mode = None if prev is None else np.array(prev)
+            self._prev_eig = self._restart_trajectory.info.get(
+                'saddleclimb_prev_eig')
             B_opt = self._get_B_opt(B, g, pos_1D)
             dx_1D = self._get_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
@@ -436,6 +450,7 @@ class SaddleClimb:
             Fmax = LA.norm(-g.reshape(-1, 3), axis=1).max()
             B = self._update_hessian(B, dg, dx_1D)
             self._step_count = n
+            prev_mode, prev_eig = self._prev_mode, self._prev_eig
             B_opt = self._get_B_opt(B, g, pos_1D)
             dx_1D = self._get_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
@@ -445,6 +460,9 @@ class SaddleClimb:
             atoms.info["saddleclimb_hessian"] = B.tolist()
             atoms.info["saddleclimb_hessian_shape"] = B.shape
             atoms.info['saddleclimb_iterations'] = n + 0
+            if prev_mode is not None:
+                atoms.info['saddleclimb_prev_mode'] = prev_mode.tolist()
+                atoms.info['saddleclimb_prev_eig'] = float(prev_eig)
             image = atoms.copy()
             image.calc = SinglePointCalculator(image, energy=E, forces=f)
             traj.write(image)

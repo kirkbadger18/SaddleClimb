@@ -251,8 +251,11 @@ def test_guard_falls_back_to_bias_and_never_nulls(directed):
     eigs = np.full(n, 10.0)
     eigs[0], eigs[1] = (5.0 if directed else -5.0), 1.0
     B = basis @ np.diag(eigs) @ basis.T
-    climber._step_count = (0 if directed
-                           else climber.min_directed_steps)
+    if not directed:
+        # A free step needs a previous B to match the lowest mode to.
+        climber._step_count = climber.min_directed_steps
+        climber._prev_mode = LA.eigh(B)[1][:, 0]
+        climber._prev_eig = -5.0
 
     # Past the final endpoint and off the chord along +w: ascent along
     # +dhat and along +w both lead away from both endpoints.
@@ -342,7 +345,6 @@ def test_tripped_guard_is_a_one_off():
     The next step, where the guard passes, is free again at once.
     """
     climber = generate_saddleclimb_object()
-    climber._step_count = climber.min_directed_steps
     idx = climber.indices
     n = 3 * len(idx)
     climber._pos_i_1D = climber.atoms_initial.positions[idx, :].reshape(-1)
@@ -354,6 +356,9 @@ def test_tripped_guard_is_a_one_off():
     eigs = np.full(n, 10.0)
     eigs[0] = -5.0
     B = basis @ np.diag(eigs) @ basis.T
+    climber._step_count = climber.min_directed_steps
+    climber._prev_mode = LA.eigh(B)[1][:, 0]
+    climber._prev_eig = -5.0
 
     # Past the final endpoint, ascent along +dhat leads away from both
     # ends, so it trips.
@@ -366,3 +371,59 @@ def test_tripped_guard_is_a_one_off():
         climber._get_B_opt(B, g, pos_1D)
         free.append(climber._free)
     assert free == [True, False, True, True]
+
+
+def test_free_needs_negative_lowest_mode_that_matches_the_last_one():
+    """Free only if the lowest mode is negative and best-matched.
+
+    Before ``min_directed_steps`` every step is directed.  The first
+    step after has no previous B, so it is directed too.  A repeat of
+    the same B is free.  A negative lowest mode that is not the previous
+    lowest mode, or a lowest mode that is not negative, is directed.
+    """
+    climber = generate_saddleclimb_object()
+    idx = climber.indices
+    n = 3 * len(idx)
+    climber._pos_i_1D = climber.atoms_initial.positions[idx, :].reshape(-1)
+    climber._pos_f_1D = climber.atoms_final.positions[idx, :].reshape(-1)
+    chord = climber._pos_f_1D - climber._pos_i_1D
+    dhat = climber.normalize(chord)
+    basis, _ = LA.qr(dhat.reshape(n, 1), mode='complete')
+    w = basis[:, 1]
+    pos_1D = climber._pos_i_1D + 0.5 * chord
+    g = 0.1 * dhat + 0.3 * w
+
+    eigs = np.full(n, 10.0)
+    eigs[0] = -5.0
+    B = basis @ np.diag(eigs) @ basis.T
+    # Too early: directed whatever B looks like.
+    climber._get_B_opt(B, g, pos_1D)
+    climber._step_count = climber.min_directed_steps - 1
+    climber._get_B_opt(B, g, pos_1D)
+    assert not climber._free
+    climber._step_count = climber.min_directed_steps
+    climber._prev_mode = None
+    climber._get_B_opt(B, g, pos_1D)
+    assert not climber._free
+    climber._get_B_opt(B, g, pos_1D)
+    assert climber._free
+
+    # The negative mode turns into a different direction: no match.
+    eigs_2 = np.full(n, 10.0)
+    eigs_2[1] = -5.0
+    B_2 = basis @ np.diag(eigs_2) @ basis.T
+    climber._get_B_opt(B_2, g, pos_1D)
+    assert not climber._free
+
+    # Same mode, but no longer negative.
+    eigs_3 = np.full(n, 10.0)
+    eigs_3[1] = 1.0
+    B_3 = basis @ np.diag(eigs_3) @ basis.T
+    climber._get_B_opt(B_3, g, pos_1D)
+    assert not climber._free
+
+    # Previous mode matches but its eigenvalue was not negative.
+    climber._prev_mode = basis[:, 0]
+    climber._prev_eig = 0.5
+    climber._get_B_opt(B, g, pos_1D)
+    assert not climber._free
