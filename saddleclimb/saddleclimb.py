@@ -28,6 +28,7 @@ class SaddleClimb:
             delta0: float = 0.1,
             hessian_scale: float = 10,
             min_directed_steps: int = 6,
+            persistence: int = 3,
             maxstep: float = 0.2,
 
             min_travel: float = 0.1,
@@ -51,6 +52,10 @@ class SaddleClimb:
             raise ValueError('min_directed_steps must not be negative, '
                              f'got {min_directed_steps}')
         self.min_directed_steps = min_directed_steps
+        if not persistence >= 1:
+            raise ValueError('persistence must be at least 1, '
+                             f'got {persistence}')
+        self.persistence = persistence
         self.a_max = a_max
         self.max_scaling_halvings = max_scaling_halvings
         self.delta = delta0
@@ -61,7 +66,7 @@ class SaddleClimb:
         self._climbing = True
         self._step_count = 0
         self._prev_mode = None
-        self._prev_eig = None
+        self._streak = 0
         self._get_moving_atoms()
         if self.target_indices:
             self._get_sub_target_atoms()
@@ -143,18 +148,26 @@ class SaddleClimb:
         """False when the gradient points away from both ends."""
         return not (np.dot(g, dxi) < 0 and np.dot(g, dxf) < 0)
 
-    def _is_tracked_mode(self, vecs):
-        """True if the last lowest mode was negative and tracks the lowest.
-
-        The last step's lowest eigenvector is dotted with each current
-        eigenvector, and the largest absolute dot product must belong
-        to the lowest one, so eigenvector signs do not matter.  False
-        when there is no previous B yet or its lowest eigenvalue was not
-        negative.
+    def _update_streak(self, eigs, vecs):
         """
-        if self._prev_mode is None or self._prev_eig >= 0:
-            return False
-        return np.argmax(np.abs(vecs.T @ self._prev_mode)) == 0
+        Count consecutive steps with a single, persistent negative mode.
+
+        A step extends the streak when B has exactly one negative
+        eigenvalue and the last step's only negative mode, dotted with
+        each current eigenvector, overlaps most with this step's
+        negative mode (absolute dot products, so eigenvector signs do
+        not matter).  A step with exactly one negative eigenvalue that
+        does not follow on from the last starts a new streak of one,
+        and a step with none, or several, resets it to zero.
+        """
+        single = eigs[0] < 0 and (len(eigs) == 1 or eigs[1] >= 0)
+        if not single:
+            self._prev_mode, self._streak = None, 0
+            return
+        follows = (self._prev_mode is not None
+                   and np.argmax(np.abs(vecs.T @ self._prev_mode)) == 0)
+        self._streak = self._streak + 1 if follows else 1
+        self._prev_mode = vecs[:, 0]
 
     def _get_B_opt(self, B, g, pos_1D):
         """
@@ -165,13 +178,13 @@ class SaddleClimb:
         lowest across it, and it climbs a convex mode only if it sees
         that mode's true, positive curvature.  The first
         ``min_directed_steps`` steps are always directed.  After that a
-        step is free when B's lowest eigenvalue is negative and its lowest
-        eigenvector is the one with the largest overlap with the lowest
-        eigenvector of the previous step's B, whose eigenvalue was also
-        negative.  B is then used as it is and its lowest mode is
-        climbed.  Otherwise, including the first step, which has
-        no previous B, the step is directed: the bias is decoupled from
-        the rest of B and climbed.  A free step whose gradient points
+        step is free when the last ``persistence`` steps, this one
+        included, each had exactly one negative eigenvalue, and each
+        one's negative mode overlapped most with the next one's
+        negative mode (see ``_update_streak``).  B is then used as it
+        is and its negative mode is climbed.  Otherwise, including a
+        B with several negative modes, the step is directed: the bias is
+        decoupled from the rest of B and climbed.  A free step whose gradient points
         away from both ends trips the guard: ``_climbing`` is cleared and
         the climb component of that step is nulled, leaving the descent
         across the climb mode.  The guard affects only the step it trips
@@ -181,11 +194,9 @@ class SaddleClimb:
         dxi = self._pos_i_1D - pos_1D
         dxf = self._pos_f_1D - pos_1D
         eigs_B, vecs_B = LA.eigh(B)
+        self._update_streak(eigs_B, vecs_B)
         free = (self._step_count >= self.min_directed_steps
-                and eigs_B[0] < 0
-                and self._is_tracked_mode(vecs_B))
-        self._prev_mode = vecs_B[:, 0]
-        self._prev_eig = eigs_B[0]
+                and self._streak >= self.persistence)
         self._climbing = True
         if free:
             self._climbing = self._is_climbing(g, dxi, dxf)
@@ -435,8 +446,8 @@ class SaddleClimb:
             self._step_count = n
             prev = self._restart_trajectory.info.get('saddleclimb_prev_mode')
             self._prev_mode = None if prev is None else np.array(prev)
-            self._prev_eig = self._restart_trajectory.info.get(
-                'saddleclimb_prev_eig')
+            self._streak = self._restart_trajectory.info.get(
+                'saddleclimb_streak', 0)
             B_opt = self._get_B_opt(B, g, pos_1D)
             dx_1D = self._get_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
@@ -457,7 +468,7 @@ class SaddleClimb:
             Fmax = LA.norm(-g.reshape(-1, 3), axis=1).max()
             B = self._update_hessian(B, dg, dx_1D)
             self._step_count = n
-            prev_mode, prev_eig = self._prev_mode, self._prev_eig
+            prev_mode, streak = self._prev_mode, self._streak
             B_opt = self._get_B_opt(B, g, pos_1D)
             dx_1D = self._get_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
@@ -467,9 +478,11 @@ class SaddleClimb:
             atoms.info["saddleclimb_hessian"] = B.tolist()
             atoms.info["saddleclimb_hessian_shape"] = B.shape
             atoms.info['saddleclimb_iterations'] = n + 0
-            if prev_mode is not None:
+            atoms.info['saddleclimb_streak'] = int(streak)
+            if prev_mode is None:
+                atoms.info.pop('saddleclimb_prev_mode', None)
+            else:
                 atoms.info['saddleclimb_prev_mode'] = prev_mode.tolist()
-                atoms.info['saddleclimb_prev_eig'] = float(prev_eig)
             image = atoms.copy()
             image.calc = SinglePointCalculator(image, energy=E, forces=f)
             traj.write(image)
