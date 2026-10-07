@@ -58,6 +58,7 @@ class SaddleClimb:
         self.trajfile = trajfile
         self._restart = False
         self._free = False
+        self._climbing = True
         self._step_count = 0
         self._prev_mode = None
         self._prev_eig = None
@@ -138,11 +139,9 @@ class SaddleClimb:
         B_new = mult(new_basis, mult(B_transformed, new_basis.T))
         return B_new, new_basis[:, 0]
 
-    def _is_climbing(self, vmax, g, dxi, dxf):
-        """False when the ascent direction leads away from both ends."""
-        ascent_dir = vmax if np.dot(g, vmax) > 0 else -vmax
-        return not (np.dot(ascent_dir, dxi) < 0
-                    and np.dot(ascent_dir, dxf) < 0)
+    def _is_climbing(self, g, dxi, dxf):
+        """False when the gradient points away from both ends."""
+        return not (np.dot(g, dxi) < 0 and np.dot(g, dxf) < 0)
 
     def _is_tracked_mode(self, vecs):
         """True if the last lowest mode was negative and tracks the lowest.
@@ -172,11 +171,12 @@ class SaddleClimb:
         negative.  B is then used as it is and its lowest mode is
         climbed.  Otherwise, including the first step, which has
         no previous B, the step is directed: the bias is decoupled from
-        the rest of B and climbed.  A free step whose uphill direction
-        leads away from both ends also falls back to the bias.  The
-        guard affects only the step it trips on, a tripped guard climbs
-        the bias and never zeroes the step, and bias steps are never
-        guarded.  The climb mode is stored in ``_climb_mode``.
+        the rest of B and climbed.  A free step whose gradient points
+        away from both ends trips the guard: ``_climbing`` is cleared and
+        the climb component of that step is nulled, leaving the descent
+        across the climb mode.  The guard affects only the step it trips
+        on, and bias steps are never guarded.  The climb mode is stored
+        in ``_climb_mode``.
         """
         dxi = self._pos_i_1D - pos_1D
         dxf = self._pos_f_1D - pos_1D
@@ -186,11 +186,10 @@ class SaddleClimb:
                 and self._is_tracked_mode(vecs_B))
         self._prev_mode = vecs_B[:, 0]
         self._prev_eig = eigs_B[0]
+        self._climbing = True
         if free:
-            followed = vecs_B[:, 0]
-            free = self._is_climbing(followed, g, dxi, dxf)
-        if free:
-            B_opt, v = B, followed
+            self._climbing = self._is_climbing(g, dxi, dxf)
+            B_opt, v = B, vecs_B[:, 0]
         else:
             bias = self._get_bias_vector(pos_1D)
             B_opt, v = self._get_directed_hessian(B, bias / LA.norm(bias))
@@ -211,7 +210,14 @@ class SaddleClimb:
     def _get_scaled_climb_step(self, B_opt, g, vmax, a):
         """
         Climb component of the P-RFO step, maximised along ``vmax``.
+
+        When the guard has cleared ``_climbing`` this component is
+        nulled rather than descended: climb and descent would otherwise
+        be the same mode pulling opposite ways, and what is left
+        relaxes everything perpendicular to it.
         """
+        if not self._climbing:
+            return np.zeros_like(g)
         climb_M = np.array([
             [a**2*mult(vmax.T, mult(B_opt, vmax)), a*mult(vmax.T, g)],
             [a*mult(g.T, vmax), 0]

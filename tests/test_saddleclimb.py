@@ -183,61 +183,64 @@ def test_pfro_uses_one_scaling_for_climb_and_descent():
         descend(climber.a_max))
 
 
-def test_climb_guard_reads_ascent_direction_not_gradient():
-    """The guard tests the direction the ascent component moves.
+def test_pfro_step_nulls_ascent_when_not_climbing():
+    """The guard drops the vmax component; the rest still relaxes."""
+    climber = generate_saddleclimb_object()
+    rng = np.random.default_rng(0)
+    for _ in range(5):
+        n = 12
+        Q, _ = LA.qr(rng.standard_normal((n, n)))
+        eigs = rng.uniform(0.2, 30, n)
+        eigs[0] = -eigs[0]
+        B_opt = Q @ np.diag(np.sort(eigs)) @ Q.T
+        g = rng.standard_normal(n) * 0.3
+        _, vecs = LA.eigh(B_opt)
+        vmax = vecs[:, 0]
+        climber._climb_mode = vmax
 
-    The step along vmax carries the sign of g.vmax, so the ascent
-    direction is +/- vmax, not g.  Off the endpoint chord both endpoint
-    dots pick up a shared perpendicular term, so a gradient dominated by
-    that term -- the near-convergence case -- reads as "away from both"
-    no matter what the climb is doing.  The ascent direction does not.
-    """
+        climber._climbing = True
+        climbed = climber._get_pfro_step(B_opt, g)
+        assert abs(np.dot(climbed, vmax)) > 1e-8
+
+        climber._climbing = False
+        step = climber._get_pfro_step(B_opt, g)
+        assert_allclose(np.dot(step, vmax), 0, atol=1e-12)
+        assert np.dot(g, step) < 0
+        assert (climber._get_maxstep(step)
+                <= climber.maxstep + 1e-9)
+
+
+def test_climb_guard_reads_the_gradient():
+    """The guard stops only when the gradient points away from both ends."""
     climber = generate_saddleclimb_object()
     idx = climber.indices
-    n = 3 * len(idx)
     climber._pos_i_1D = climber.atoms_initial.positions[idx, :].reshape(-1)
     climber._pos_f_1D = climber.atoms_final.positions[idx, :].reshape(-1)
-
-    half = (climber._pos_f_1D - climber._pos_i_1D) / 2
-    chord = climber.normalize(half)
-    basis, _ = LA.qr(chord.reshape(n, 1), mode='complete')
-    off = basis[:, 1]
-    # Sit off the chord, so both endpoints lie back along -off.
-    pos_1D = climber._pos_i_1D + half + 0.5 * off
+    chord = climber._pos_f_1D - climber._pos_i_1D
+    dhat = climber.normalize(chord)
+    pos_1D = climber._pos_i_1D + 0.5 * chord
     dxi = climber._pos_i_1D - pos_1D
     dxf = climber._pos_f_1D - pos_1D
 
-    def hessian_with_lowest_mode(vec):
-        vecs, _ = LA.qr(vec.reshape(n, 1), mode='complete')
-        return vecs @ np.diag(np.concatenate(([-5.0],
-                                              np.full(n - 1, 5.0)))) @ vecs.T
+    # Uphill toward either end: still climbing.
+    assert climber._is_climbing(dhat, dxi, dxf)
+    assert climber._is_climbing(-dhat, dxi, dxf)
 
-    # Gradient dominated by +off: both endpoint dots go negative, so the
-    # gradient rule stops.  The ascent direction lies along the chord and
-    # still points at an endpoint, so the climb continues.
-    g = 0.01 * chord + 8.0 * off
-    assert np.dot(g, dxi) < 0 and np.dot(g, dxf) < 0
-    assert climber._is_climbing(chord, g, dxi, dxf)
-
-    # Converse: the gradient still points at the final endpoint, but the
-    # ascent direction is +off, which leads away from both.  Asserted on
-    # the guard itself.  Which mode gets selected is a separate question
-    # from what the guard reads.
-    g = 8.0 * chord + 0.01 * off
-    assert np.dot(g, dxf) > 0
-    assert not climber._is_climbing(off, g, dxi, dxf)
+    # Uphill across the chord, away from both ends: stop.
+    basis, _ = LA.qr(dhat.reshape(-1, 1), mode='complete')
+    off = basis[:, 1]
+    far = climber._pos_i_1D + 0.5 * chord + 0.5 * off
+    dxi = climber._pos_i_1D - far
+    dxf = climber._pos_f_1D - far
+    assert not climber._is_climbing(off, dxi, dxf)
 
 
-@pytest.mark.parametrize('directed', [True, False])
-def test_guard_falls_back_to_bias_and_never_nulls(directed):
-    """A free step failing the guard climbs the bias instead; bias steps
-    are not guarded at all.
+def test_tripped_guard_nulls_the_free_climb_step_and_bias_is_unguarded():
+    """A free step failing the guard keeps the lowest mode but nulls the
+    climb component; a directed step is not guarded at all.
 
-    Ascent along the bias and along w both lead away from both
-    endpoints.  Free (the bias mode is negative), the climbed mode fails
-    the guard and the step falls back to the bias; directed, the bias is
-    climbed unguarded.  Either way the bias is the climb mode and the
-    step still has a component along it.
+    Past the final endpoint and off the chord along +w, a gradient along
+    +w leads away from both endpoints.
     """
     climber = generate_saddleclimb_object()
     idx = climber.indices
@@ -248,29 +251,30 @@ def test_guard_falls_back_to_bias_and_never_nulls(directed):
     dhat = climber.normalize(chord)
     basis, _ = LA.qr(dhat.reshape(n, 1), mode='complete')
     w = basis[:, 1]
-    eigs = np.full(n, 10.0)
-    eigs[0], eigs[1] = (5.0 if directed else -5.0), 1.0
-    B = basis @ np.diag(eigs) @ basis.T
-    if not directed:
-        # A free step needs a previous B to match the lowest mode to.
-        climber._step_count = climber.min_directed_steps
-        climber._prev_mode = LA.eigh(B)[1][:, 0]
-        climber._prev_eig = -5.0
-
-    # Past the final endpoint and off the chord along +w: ascent along
-    # +dhat and along +w both lead away from both endpoints.
-    pos_1D = climber._pos_i_1D + 1.3 * chord + 0.5 * w
+    far = climber._pos_i_1D + 1.3 * chord + 0.5 * w
     g = 0.5 * dhat + 0.3 * w
-    dxi = climber._pos_i_1D - pos_1D
-    dxf = climber._pos_f_1D - pos_1D
-    assert not climber._is_climbing(w, g, dxi, dxf)
-    assert not climber._is_climbing(dhat, g, dxi, dxf)
+    assert not climber._is_climbing(g, climber._pos_i_1D - far,
+                                    climber._pos_f_1D - far)
 
-    B_opt = climber._get_B_opt(B, g, pos_1D)
-    assert_allclose(abs(np.dot(climber._climb_mode, dhat)), 1, atol=1e-10)
-    assert not climber._free
-    step = climber._get_step(B_opt, g)
-    assert abs(np.dot(step, dhat)) > 1e-6
+    for directed in (True, False):
+        eigs = np.full(n, 10.0)
+        eigs[0], eigs[1] = (5.0 if directed else -5.0), 1.0
+        B = basis @ np.diag(eigs) @ basis.T
+        if not directed:
+            climber._step_count = climber.min_directed_steps
+            climber._prev_mode = LA.eigh(B)[1][:, 0]
+            climber._prev_eig = -5.0
+        B_opt = climber._get_B_opt(B, g, far)
+        step = climber._get_step(B_opt, g)
+        v = climber._climb_mode
+        assert_allclose(abs(np.dot(v, dhat)), 1, atol=1e-10)
+        assert bool(climber._free) == (not directed)
+        assert bool(climber._climbing) == directed
+        if directed:
+            assert abs(np.dot(step, v)) > 1e-6
+        else:
+            assert_allclose(np.dot(step, v), 0, atol=1e-12)
+
 
 def test_directed_b_opt_keeps_signs_and_prfo_climbs_convex_bias():
     """B_opt only decouples the bias; P-RFO still climbs it.
@@ -340,11 +344,13 @@ def test_target_indices_set_the_qst_bias():
 
 
 def test_tripped_guard_is_a_one_off():
-    """A tripped guard biases only the step it trips on.
+    """A tripped guard nulls only the step it trips on.
 
-    The next step, where the guard passes, is free again at once.
+    The next step, where the guard passes, climbs again at once, and the
+    step stays free throughout.
     """
     climber = generate_saddleclimb_object()
+    climber._step_count = climber.min_directed_steps
     idx = climber.indices
     n = 3 * len(idx)
     climber._pos_i_1D = climber.atoms_initial.positions[idx, :].reshape(-1)
@@ -356,21 +362,20 @@ def test_tripped_guard_is_a_one_off():
     eigs = np.full(n, 10.0)
     eigs[0] = -5.0
     B = basis @ np.diag(eigs) @ basis.T
-    climber._step_count = climber.min_directed_steps
     climber._prev_mode = LA.eigh(B)[1][:, 0]
     climber._prev_eig = -5.0
 
-    # Past the final endpoint, ascent along +dhat leads away from both
-    # ends, so it trips.
+    # Past the final endpoint, a gradient along +w leads away from both.
     far = climber._pos_i_1D + 1.3 * chord + 0.5 * w
     mid = climber._pos_i_1D + 0.5 * chord
-    free = []
+    climbing = []
     for pos_1D, g in [(mid, 0.1 * dhat + 0.3 * w), (far, 0.5 * dhat + 0.3 * w),
                       (mid, 0.1 * dhat + 0.3 * w),
                       (mid, 0.1 * dhat + 0.3 * w)]:
         climber._get_B_opt(B, g, pos_1D)
-        free.append(climber._free)
-    assert free == [True, False, True, True]
+        assert climber._free
+        climbing.append(climber._climbing)
+    assert climbing == [True, False, True, True]
 
 
 def test_free_needs_negative_lowest_mode_that_matches_the_last_one():
