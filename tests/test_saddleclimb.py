@@ -444,3 +444,106 @@ def test_free_needs_a_persistent_single_negative_mode():
     with pytest.raises(ValueError):
         SaddleClimb(climber.atoms_initial, climber.atoms_final, EMT(),
                     persistence=0)
+
+
+def directed_setup(interp, scale=0.2):
+    """A climber part-way along its path and a convex B, so the step is
+    directed (``_step_count`` is still below ``min_directed_steps``)."""
+    climber = generate_saddleclimb_object(interp)
+    idx = climber.indices
+    n = 3 * len(idx)
+    climber._pos_i_1D = climber.atoms_initial.positions[idx, :].reshape(-1)
+    climber._pos_f_1D = climber.atoms_final.positions[idx, :].reshape(-1)
+    rng = np.random.default_rng(7)
+    A = rng.standard_normal((n, n))
+    B = A @ A.T + 2 * np.eye(n)
+    off = 0.02 * rng.standard_normal(n)
+    pos = (climber._pos_i_1D
+           + scale * (climber._pos_f_1D - climber._pos_i_1D) + off)
+    g = 0.3 * rng.standard_normal(n)
+    return climber, B, g, pos
+
+
+def descent_across(climber, B_opt, g, a):
+    basis, _ = LA.qr(climber._climb_mode.reshape(-1, 1), mode='complete')
+    return climber._get_scaled_descend_step(B_opt, g, basis[:, 1:], a)
+
+
+@pytest.mark.parametrize('interp', ['linear', 'qst'])
+def test_path_climb_with_given_alpha_is_the_path_structure_at_f_star(interp):
+    """The climb is the path structure at f* minus the current one.
+
+    f* is the P-RFO maximum on the gradient and curvature projected
+    onto the path tangent, and the rest of the step is the usual descent
+    across the tangent, at the same alpha.
+    """
+    climber, B, g, pos = directed_setup(interp)
+    B_opt = climber._get_B_opt(B, g, pos)
+    assert not climber._free
+    f, t, nodes, path_at = climber._path
+    assert_allclose(abs(climber._climb_mode @ climber.normalize(t)), 1,
+                    atol=1e-10)
+    a = 0.15
+    f_star = np.clip(f + climber._get_scaled_path_step(
+        t @ B_opt @ t, t @ g, a), 0, 1)
+    expected = path_at(f_star) - pos + descent_across(climber, B_opt, g, a)
+    if climber._get_maxstep(expected) > climber.maxstep:
+        expected *= climber.maxstep / climber._get_maxstep(expected)
+    assert_allclose(climber._get_pfro_step(B_opt, g, a), expected,
+                    atol=1e-10)
+
+
+@pytest.mark.parametrize('interp', ['linear', 'qst'])
+def test_path_climb_search_fills_the_trust_radius(interp):
+    """The searched scaling uses the whole trust radius, and the step
+    matches the path structure at the f* of that scaling.
+
+    A large gradient makes the trust radius bind.  The polynomial that
+    stands in for the path during the search is checked against solving
+    the path at the f* it ends on.
+    """
+    climber, B, g, pos = directed_setup(interp)
+    g = 8 * g
+    B_opt = climber._get_B_opt(B, g, pos)
+    f, t, nodes, path_at = climber._path
+    step = climber._get_pfro_step(B_opt, g)
+    assert_allclose(climber._get_maxstep(step), climber.maxstep, rtol=2e-2)
+
+    # The climb part of the step, as a move along f, lands on the path.
+    descent = LA.lstsq(
+        LA.qr(climber._climb_mode.reshape(-1, 1), mode='complete')[0][:, 1:],
+        step, rcond=None)[0]
+    across = LA.qr(climber._climb_mode.reshape(-1, 1),
+                   mode='complete')[0][:, 1:] @ descent
+    climb = step - across
+    assert LA.norm(climb) > 0
+    f_new = f + (climb @ t) / (t @ t)
+    assert_allclose(path_at(np.clip(f_new, 0, 1)) - pos, climb, atol=2e-3)
+
+
+def test_path_climb_cannot_pass_the_end_structures():
+    """A huge gradient along the path stops f* at the final structure."""
+    climber, B, g, pos = directed_setup('linear', scale=0.5)
+    climber.maxstep = 100.0
+    f, t, nodes, path_at = climber._get_path_frame(pos)
+    g = 1e4 * t / LA.norm(t)
+    B_opt = climber._get_B_opt(B, g, pos)
+    step = climber._get_pfro_step(B_opt, g, 1.0)
+    # The linear path runs through the current structure parallel to the
+    # chord, so f* = 1 is the rest of the chord from here.
+    assert_allclose(step, (1 - f) * t, atol=1e-6)
+
+
+def test_path_climb_off_gives_the_straight_climb():
+    """With ``path_climb=False`` the climb is the old step along the bias."""
+    climber, B, g, pos = directed_setup('qst')
+    climber.path_climb = False
+    B_opt = climber._get_B_opt(B, g, pos)
+    a = 0.15
+    v = climber._climb_mode
+    expected = (climber._get_scaled_climb_step(B_opt, g, v, a)
+                + descent_across(climber, B_opt, g, a))
+    if climber._get_maxstep(expected) > climber.maxstep:
+        expected *= climber.maxstep / climber._get_maxstep(expected)
+    assert_allclose(climber._get_pfro_step(B_opt, g, a), expected,
+                    atol=1e-12)

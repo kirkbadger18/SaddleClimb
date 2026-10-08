@@ -27,7 +27,7 @@ class SaddleClimb:
 
             delta0: float = 0.1,
             hessian_scale: float = 10,
-            min_directed_steps: int = 6,
+            min_directed_steps: int = 8,
             persistence: int = 3,
             maxstep: float = 0.2,
 
@@ -35,6 +35,7 @@ class SaddleClimb:
             a_max: float = 1,
             max_scaling_halvings: int = 60,
             delta_f: float = 0.05,
+            path_climb: bool = True,
             ) -> None:
 
         self.atoms_initial = atoms_initial
@@ -44,6 +45,7 @@ class SaddleClimb:
         assert interp in ('linear', 'qst')
         self.interp = interp
         self.delta_f = delta_f
+        self.path_climb = path_climb
         self.fmax = fmax
         self.maxstep = maxstep
         self.min_travel = min_travel
@@ -64,6 +66,7 @@ class SaddleClimb:
         self._restart = False
         self._free = False
         self._climbing = True
+        self._path = None
         self._step_count = 0
         self._prev_mode = None
         self._streak = 0
@@ -127,6 +130,47 @@ class SaddleClimb:
     def _get_bias_vector(self, pos_1D):
         """Bias direction with atoms outside ``target_indices`` held."""
         return self._hold_non_targets(self._get_bias_direction(pos_1D))
+
+    def _get_path_frame(self, pos_1D):
+        """
+        Path variable f of the current structure, the tangent there, and
+        the path itself.
+
+        Returns ``f``, the tangent ``t = dx/df`` over the moving atoms
+        (atoms outside ``target_indices`` held), the moving-atom
+        positions already known on the path as a dict ``{f: x}``, and a
+        function that solves for the positions at any other ``f``.  A
+        linear path is a straight line along the chord through the
+        current structure; a QST path is the quadratic path through it
+        (see ``_get_qst_positions``).  The two QST structures that
+        give the tangent are kept, so they cost nothing again.
+        """
+        if self.interp == 'linear':
+            chord = self._hold_non_targets(self._pos_f_1D - self._pos_i_1D)
+            f = (pos_1D - self._pos_i_1D) @ chord / (chord @ chord)
+            return (f, chord, {f: pos_1D, f + 1: pos_1D + chord},
+                    lambda f_star: pos_1D + (f_star - f) * chord)
+        pos = self.atoms_initial.positions.copy()
+        pos[self.indices, :] = pos_1D.reshape(-1, 3)
+        p_m = self._get_path_coordinate(pos)
+        f_minus = max(p_m - self.delta_f, 0)
+        f_plus = min(p_m + self.delta_f, 1)
+        x_minus = self._get_qst_positions(pos, f_minus)
+        x_plus = self._get_qst_positions(pos, f_plus)
+        t = (self._hold_non_targets(x_plus - x_minus)
+             / (f_plus - f_minus))
+        bias_rows = [self.indices.index(i) for i in self._bias_atoms]
+
+        def path_at(f_star):
+            # Start the fit from the straight line along the tangent, which
+            # is already close, rather than from the current structure.
+            guess = pos.copy()
+            guess[self._bias_atoms] += ((f_star - p_m)
+                                        * t.reshape(-1, 3)[bias_rows])
+            return self._get_qst_positions(pos, f_star, guess)
+
+        return (p_m, t, {f_minus: x_minus, p_m: pos_1D, f_plus: x_plus},
+                path_at)
 
     def _get_directed_hessian(self, B, bias):
         """
@@ -198,11 +242,14 @@ class SaddleClimb:
         free = (self._step_count >= self.min_directed_steps
                 and self._streak >= self.persistence)
         self._climbing = True
+        self._path = None
+        self._pos_cur = pos_1D
         if free:
             self._climbing = self._is_climbing(g, dxi, dxf)
             B_opt, v = B, vecs_B[:, 0]
         else:
-            bias = self._get_bias_vector(pos_1D)
+            self._path = self._get_path_frame(pos_1D)
+            bias = self._path[1]
             B_opt, v = self._get_directed_hessian(B, bias / LA.norm(bias))
         self._climb_mode = v
         self._free = free
@@ -236,6 +283,14 @@ class SaddleClimb:
         _, svecs_max = LA.eigh(climb_M)
         return (a*svecs_max[0, 1] / svecs_max[1, 1]) * vmax
 
+    def _get_scaled_path_step(self, H_f, G_f, a):
+        """
+        P-RFO maximum along the path variable: the change in ``f``, from
+        the gradient ``G_f = dE/df`` and curvature ``H_f = d2E/df2``.
+        """
+        _, svecs = LA.eigh(np.array([[a**2*H_f, a*G_f], [a*G_f, 0.0]]))
+        return a*svecs[0, 1] / svecs[1, 1]
+
     def _get_scaled_descend_step(self, B_opt, g, vmin, a):
         """Descent component, minimised in the space spanned by ``vmin``."""
         Ndim = len(g)
@@ -246,6 +301,53 @@ class SaddleClimb:
         _, svecs_min = LA.eigh(descend_M)
         smin = (a / svecs_min[-1, 0]) * svecs_min[0:Ndim-1, 0]
         return mult(vmin, smin)
+
+    def _get_path_climb(self, B_opt, g, vmin, a):
+        """
+        Climb step as a function of the scaling, solved in path space.
+
+        The gradient and Hessian are projected onto the path tangent and
+        the P-RFO maximum at each scaling gives ``f*``, kept between the
+        end structures.  The climb is the path structure at ``f*`` minus
+        the current one, so it bends with the path.
+
+        The path is solved few times.  A search with the straight line
+        along the tangent places ``f*`` first, the path is solved there
+        once, and a polynomial in ``f`` through that and the structures
+        already known (the current one and the two that gave the
+        tangent) stands in for the path while the scaling is searched.
+        With an explicit ``a`` the path is solved at ``f*`` itself.
+        """
+        f, t, nodes, path_at = self._path
+        G_f, H_f = t @ g, t @ B_opt @ t
+        x0 = self._pos_cur
+
+        def f_star(scale):
+            return np.clip(
+                f + self._get_scaled_path_step(H_f, G_f, scale), 0, 1)
+
+        if a is not None:
+            return lambda scale: path_at(f_star(scale)) - x0
+
+        def descend(scale):
+            return self._get_scaled_descend_step(B_opt, g, vmin, scale)
+
+        scale0 = self._get_pfro_scaling(
+            lambda scale: (f_star(scale) - f) * t + descend(scale),
+            self.maxstep)
+        f0 = f_star(scale0)
+        if all(abs(f0 - known) > 1e-6 for known in nodes):
+            nodes = {**nodes, f0: path_at(f0)}
+        fs = np.array(sorted(nodes))
+        xs = np.array([nodes[k] for k in fs])
+
+        def climb(scale):
+            x = f_star(scale)
+            weights = [np.prod([(x - fj) / (fi - fj)
+                                for fj in fs if fj != fi]) for fi in fs]
+            return np.tensordot(weights, xs, axes=1) - x0
+
+        return climb
 
     def _get_pfro_scaling(self, component, radius):
         """
@@ -288,7 +390,9 @@ class SaddleClimb:
     def _get_pfro_step(self, B_opt, g, a=None):
         """
         Partitioned RFO step: maximized along ``_climb_mode``, minimized
-        in the space across it.  One scaling is solved for the whole
+        in the space across it.  On a directed step with ``path_climb``
+        the maximum is solved in the path variable ``f`` (see
+        ``_get_path_climb``).  One scaling is solved for the whole
         step against the single trust radius ``maxstep``, and both
         partitions use it.  With an explicit ``a`` the
         search is skipped.  The linear truncation is kept as a
@@ -300,8 +404,11 @@ class SaddleClimb:
         basis, _ = LA.qr(vmax.reshape(-1, 1), mode='complete')
         vmin = basis[:, 1:]
 
-        def climb(scale):
-            return self._get_scaled_climb_step(B_opt, g, vmax, scale)
+        if self.path_climb and self._path is not None:
+            climb = self._get_path_climb(B_opt, g, vmin, a)
+        else:
+            def climb(scale):
+                return self._get_scaled_climb_step(B_opt, g, vmax, scale)
 
         def descend(scale):
             return self._get_scaled_descend_step(B_opt, g, vmin, scale)
@@ -507,17 +614,20 @@ class SaddleClimb:
         return (self._get_qst_positions(pos, f_plus)
                 - self._get_qst_positions(pos, f_minus))
 
-    def _get_qst_positions(self, pos, f):
+    def _get_qst_positions(self, pos, f, guess=None):
         """
         Moving-atom positions at ``f`` on the QST path through pos.
 
         Only the bias atoms are fitted to the interpolated distances.
         Every other atom is held where it is in ``pos``, so it still
         shapes the fit through its pairs with the bias atoms but does
-        not move.
+        not move.  ``guess`` is the structure the fit starts from, and
+        it must agree with ``pos`` on every atom that is held; by
+        default it is ``pos``.
         """
         pos_f = self.get_positions_from_distances(
-            self.get_qst_distances(pos, f), pos, self._bias_atoms)
+            self.get_qst_distances(pos, f), pos if guess is None else guess,
+            self._bias_atoms)
         return pos_f[self.indices, :].reshape(-1)
 
     def _get_path_coordinate(self, positions: np.ndarray) -> float:
