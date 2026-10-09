@@ -684,18 +684,20 @@ class SaddleClimb:
         through their shared pairs.  `indices=None` frees every atom.
         Returns an array shaped like `atoms.positions`.
 
-        Pairs are weighted by 1/r_R^4 + 1/r_P^4 from the two endpoint
-        structures, rather than by 1/r_interp^4 as in eq. (3), so the
-        weights are fixed by the reaction rather than shifting with the
-        current geometry.
+        Pairs are weighted by 1/r_interp^4 + 1/r_P^4: the interpolated
+        distance as in eq. (3), plus the product distance.  The first
+        term weights a pair by how close the path wants it at this
+        point, which the endpoints alone cannot know, so an intermediate
+        image is not fitted with fragments pushed into the surface or
+        each other.  The second keeps pairs that are bonded in the
+        product weighted while they are still far apart on the path.
         """
         free = (np.arange(len(positions_guess)) if indices is None
                 else np.asarray(indices))
         iu = np.triu_indices(len(positions_guess), k=1)
         r_i = r_interp[iu]
-        r_R = self._pair_distances(self.atoms_initial.positions)[iu]
         r_P = self._pair_distances(self.atoms_final.positions)[iu]
-        w = 1 / r_R**4 + 1 / r_P**4
+        w = 1 / r_i**4 + 1 / r_P**4
         x0 = positions_guess[free].reshape(-1)
 
         def S_and_grad(x):

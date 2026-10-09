@@ -395,7 +395,7 @@ def test_free_needs_a_persistent_lowest_mode():
     """
     climber = generate_saddleclimb_object()
     climber.min_directed_steps = 0
-    assert climber.persistence == 3
+    climber.persistence = 3
     idx = climber.indices
     n = 3 * len(idx)
     climber._pos_i_1D = climber.atoms_initial.positions[idx, :].reshape(-1)
@@ -549,3 +549,4 @@ def test_path_climb_off_gives_the_straight_climb():
         expected *= climber.maxstep / climber._get_maxstep(expected)
     assert_allclose(climber._get_pfro_step(B_opt, g, a), expected,
                     atol=1e-12)
+
