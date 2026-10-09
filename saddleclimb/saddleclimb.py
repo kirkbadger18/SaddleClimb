@@ -27,8 +27,8 @@ class SaddleClimb:
 
             delta0: float = 0.1,
             hessian_scale: float = 10,
-            min_directed_steps: int = 8,
-            persistence: int = 3,
+            min_directed_steps: int = 6,
+            persistence: int = 2,
             maxstep: float = 0.2,
 
             min_travel: float = 0.1,
@@ -188,24 +188,31 @@ class SaddleClimb:
         B_new = mult(new_basis, mult(B_transformed, new_basis.T))
         return B_new, new_basis[:, 0]
 
-    def _is_climbing(self, g, dxi, dxf):
-        """False when the gradient points away from both ends."""
-        return not (np.dot(g, dxi) < 0 and np.dot(g, dxf) < 0)
+    def _is_climbing(self, v, g, dxi, dxf):
+        """
+        False when the uphill climb direction points away from both ends.
+
+        The climb mode ``v`` has no sign of its own, so it is oriented
+        uphill (positive dot product with the gradient ``g``) first.
+        """
+        if np.dot(v, g) < 0:
+            v = -v
+        return not (np.dot(v, dxi) < 0 and np.dot(v, dxf) < 0)
 
     def _update_streak(self, eigs, vecs):
         """
-        Count consecutive steps with a single, persistent negative mode.
+        Count consecutive steps with a persistent lowest mode.
 
-        A step extends the streak when B has exactly one negative
-        eigenvalue and the last step's only negative mode, dotted with
-        each current eigenvector, overlaps most with this step's
-        negative mode (absolute dot products, so eigenvector signs do
-        not matter).  A step with exactly one negative eigenvalue that
-        does not follow on from the last starts a new streak of one,
-        and a step with none, or several, resets it to zero.
+        A step extends the streak when the lowest eigenvalue of B is
+        negative and the last step's lowest mode, dotted with each
+        current eigenvector, overlaps most with this step's lowest
+        mode (absolute dot products, so eigenvector signs do not
+        matter).  A step with a negative lowest eigenvalue that does
+        not follow on from the last starts a new streak of one, and a
+        step with none resets it to zero.  Other negative eigenvalues
+        are ignored.
         """
-        single = eigs[0] < 0 and (len(eigs) == 1 or eigs[1] >= 0)
-        if not single:
+        if not eigs[0] < 0:
             self._prev_mode, self._streak = None, 0
             return
         follows = (self._prev_mode is not None
@@ -223,13 +230,13 @@ class SaddleClimb:
         that mode's true, positive curvature.  The first
         ``min_directed_steps`` steps are always directed.  After that a
         step is free when the last ``persistence`` steps, this one
-        included, each had exactly one negative eigenvalue, and each
-        one's negative mode overlapped most with the next one's
-        negative mode (see ``_update_streak``).  B is then used as it
-        is and its negative mode is climbed.  Otherwise, including a
-        B with several negative modes, the step is directed: the bias is
-        decoupled from the rest of B and climbed.  A free step whose gradient points
-        away from both ends trips the guard: ``_climbing`` is cleared and
+        included, each had a negative lowest eigenvalue, and each
+        one's lowest mode overlapped most with the next one's lowest
+        mode (see ``_update_streak``).  B is then used as it
+        is and its lowest mode is climbed.  Otherwise the step is
+        directed: the bias is decoupled from the rest of B and climbed.
+        A free step whose climb mode, oriented uphill, points away from
+        both ends trips the guard: ``_climbing`` is cleared and
         the climb component of that step is nulled, leaving the descent
         across the climb mode.  The guard affects only the step it trips
         on, and bias steps are never guarded.  The climb mode is stored
@@ -245,8 +252,8 @@ class SaddleClimb:
         self._path = None
         self._pos_cur = pos_1D
         if free:
-            self._climbing = self._is_climbing(g, dxi, dxf)
             B_opt, v = B, vecs_B[:, 0]
+            self._climbing = self._is_climbing(v, g, dxi, dxf)
         else:
             self._path = self._get_path_frame(pos_1D)
             bias = self._path[1]

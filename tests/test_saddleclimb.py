@@ -218,7 +218,8 @@ def test_pfro_step_nulls_ascent_when_not_climbing():
 
 
 def test_climb_guard_reads_the_gradient():
-    """The guard stops only when the gradient points away from both ends."""
+    """The guard stops only when the uphill climb direction points away
+    from both ends; the sign of the mode itself does not matter."""
     climber = generate_saddleclimb_object()
     idx = climber.indices
     climber._pos_i_1D = climber.atoms_initial.positions[idx, :].reshape(-1)
@@ -230,8 +231,9 @@ def test_climb_guard_reads_the_gradient():
     dxf = climber._pos_f_1D - pos_1D
 
     # Uphill toward either end: still climbing.
-    assert climber._is_climbing(dhat, dxi, dxf)
-    assert climber._is_climbing(-dhat, dxi, dxf)
+    assert climber._is_climbing(dhat, dhat, dxi, dxf)
+    assert climber._is_climbing(-dhat, dhat, dxi, dxf)
+    assert climber._is_climbing(dhat, -dhat, dxi, dxf)
 
     # Uphill across the chord, away from both ends: stop.
     basis, _ = LA.qr(dhat.reshape(-1, 1), mode='complete')
@@ -239,7 +241,8 @@ def test_climb_guard_reads_the_gradient():
     far = climber._pos_i_1D + 0.5 * chord + 0.5 * off
     dxi = climber._pos_i_1D - far
     dxf = climber._pos_f_1D - far
-    assert not climber._is_climbing(off, dxi, dxf)
+    assert not climber._is_climbing(off, off, dxi, dxf)
+    assert not climber._is_climbing(-off, off, dxi, dxf)
 
 
 def test_tripped_guard_nulls_the_free_climb_step_and_bias_is_unguarded():
@@ -260,7 +263,7 @@ def test_tripped_guard_nulls_the_free_climb_step_and_bias_is_unguarded():
     w = basis[:, 1]
     far = climber._pos_i_1D + 1.3 * chord + 0.5 * w
     g = 0.5 * dhat + 0.3 * w
-    assert not climber._is_climbing(g, climber._pos_i_1D - far,
+    assert not climber._is_climbing(dhat, g, climber._pos_i_1D - far,
                                     climber._pos_f_1D - far)
 
     for directed in (True, False):
@@ -381,14 +384,14 @@ def test_tripped_guard_is_a_one_off():
     assert climbing == [True, False, True, True]
 
 
-def test_free_needs_a_persistent_single_negative_mode():
-    """Free only after ``persistence`` steps with one persistent negative.
+def test_free_needs_a_persistent_lowest_mode():
+    """Free only after ``persistence`` steps with a persistent lowest mode.
 
-    Each of the last ``persistence`` steps needs exactly one negative
-    eigenvalue, and each one's negative mode must overlap most with the
-    next one's.  Several negative modes, a different negative mode, or
-    none start the count over, and ``min_directed_steps`` holds the
-    climb directed whatever the streak.
+    Each of the last ``persistence`` steps needs a negative lowest
+    eigenvalue, and each one's lowest mode must overlap most with the
+    next one's.  Further negative modes are ignored; a different lowest
+    mode or none start the count over, and ``min_directed_steps`` holds
+    the climb directed whatever the streak.
     """
     climber = generate_saddleclimb_object()
     climber.min_directed_steps = 0
@@ -420,13 +423,12 @@ def test_free_needs_a_persistent_single_negative_mode():
     assert free_after(B) == (True, 3)
     assert free_after(B) == (True, 4)
 
-    # Two negative modes: directed, and the count restarts.
-    assert free_after(hessian([0, 1])) == (False, 0)
-    assert free_after(B) == (False, 1)
-    assert free_after(B) == (False, 2)
-    assert free_after(B) == (True, 3)
+    # A second, shallower negative mode is ignored: the count goes on.
+    B2 = hessian([0, 1])
+    B2 = B2 + 4.0 * np.outer(basis[:, 1], basis[:, 1])
+    assert free_after(B2) == (True, 5)
 
-    # A different single negative mode follows on from nothing.
+    # A different lowest mode follows on from nothing.
     assert free_after(hessian([1])) == (False, 1)
     assert free_after(hessian([1])) == (False, 2)
     assert free_after(hessian([1])) == (True, 3)
