@@ -26,7 +26,7 @@ class SaddleClimb:
             interp: str = 'qst',
 
             delta0: float = 0.1,
-            hessian_scale: float = 10,
+            hessian_scale: float = 50,
             min_directed_steps: int = 6,
             persistence: int = 2,
             maxstep: float = 0.2,
