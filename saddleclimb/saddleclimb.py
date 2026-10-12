@@ -26,7 +26,7 @@ class SaddleClimb:
             interp: str = 'qst',
 
             delta0: float = 0.1,
-            hessian_scale: float = 25,
+            hessian_scale: float = 10,
             min_directed_steps: int = 6,
             persistence: int = 2,
             maxstep: float = 0.2,
@@ -396,8 +396,8 @@ class SaddleClimb:
 
     def _get_pfro_step(self, B_opt, g, a=None):
         """
-        Partitioned RFO step: maximized along ``_climb_mode``, minimized
-        in the space across it.  On a directed step with ``path_climb``
+        Partitioned RFO step: maximized along the climb, minimized in
+        the space across it.  On a directed step with ``path_climb``
         the maximum is solved in the path variable ``f`` (see
         ``_get_path_climb``).  One scaling is solved for the whole
         step against the single trust radius ``maxstep``, and both
@@ -406,22 +406,44 @@ class SaddleClimb:
         safety net: the bracket is closed only to ``xtol`` in
         log(a), and for the case where no bracket could be found
         at all.
+
+        The space the descent runs in is spanned across the climb step
+        that is actually taken, not across the climb mode.  On a path
+        climb the step is the chord to the path structure at ``f*``, so
+        it bends away from the tangent; splitting on the tangent would
+        leave that bend inside the descent space, where the descent
+        would then be solved as if the climb had not moved there.  The
+        chord depends on the scaling, so its complement is rebuilt at
+        every scaling tried -- one QR per trial, no force evaluations.
+        The tangent is still what the gradient and Hessian are
+        projected on to get ``f*``.
         """
         vmax = self._climb_mode
         basis, _ = LA.qr(vmax.reshape(-1, 1), mode='complete')
         vmin = basis[:, 1:]
 
         if self.path_climb and self._path is not None:
+            # vmin here only bootstraps the path polynomial; the
+            # descent used in the step is the one below.
             climb = self._get_path_climb(B_opt, g, vmin, a)
         else:
             def climb(scale):
                 return self._get_scaled_climb_step(B_opt, g, vmax, scale)
 
-        def descend(scale):
-            return self._get_scaled_descend_step(B_opt, g, vmin, scale)
+        def descend_across(climb_step, scale):
+            """Descent across the climb step that is actually taken."""
+            norm = LA.norm(climb_step)
+            if norm == 0:
+                across = vmin
+            else:
+                frame, _ = LA.qr((climb_step / norm).reshape(-1, 1),
+                                 mode='complete')
+                across = frame[:, 1:]
+            return self._get_scaled_descend_step(B_opt, g, across, scale)
 
         def total(scale):
-            return climb(scale) + descend(scale)
+            climb_step = climb(scale)
+            return climb_step + descend_across(climb_step, scale)
 
         scale = (a if a is not None
                  else self._get_pfro_scaling(total, self.maxstep))

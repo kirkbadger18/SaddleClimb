@@ -466,8 +466,16 @@ def directed_setup(interp, scale=0.2):
     return climber, B, g, pos
 
 
-def descent_across(climber, B_opt, g, a):
-    basis, _ = LA.qr(climber._climb_mode.reshape(-1, 1), mode='complete')
+def descent_across(climber, B_opt, g, a, climb_step=None):
+    """Descent across the climb step, or across the climb mode if none.
+
+    The step is split on the climb that is actually taken, so a path
+    climb that bends away from the tangent keeps its bend out of the
+    descent space.
+    """
+    split = climber._climb_mode if climb_step is None else climb_step
+    split = split / LA.norm(split)
+    basis, _ = LA.qr(split.reshape(-1, 1), mode='complete')
     return climber._get_scaled_descend_step(B_opt, g, basis[:, 1:], a)
 
 
@@ -476,8 +484,8 @@ def test_path_climb_with_given_alpha_is_the_path_structure_at_f_star(interp):
     """The climb is the path structure at f* minus the current one.
 
     f* is the P-RFO maximum on the gradient and curvature projected
-    onto the path tangent, and the rest of the step is the usual descent
-    across the tangent, at the same alpha.
+    onto the path tangent, and the rest of the step is the descent
+    across that climb chord, at the same alpha.
     """
     climber, B, g, pos = directed_setup(interp)
     B_opt = climber._get_B_opt(B, g, pos)
@@ -488,7 +496,8 @@ def test_path_climb_with_given_alpha_is_the_path_structure_at_f_star(interp):
     a = 0.15
     f_star = np.clip(f + climber._get_scaled_path_step(
         t @ B_opt @ t, t @ g, a), 0, 1)
-    expected = path_at(f_star) - pos + descent_across(climber, B_opt, g, a)
+    climb_step = path_at(f_star) - pos
+    expected = climb_step + descent_across(climber, B_opt, g, a, climb_step)
     if climber._get_maxstep(expected) > climber.maxstep:
         expected *= climber.maxstep / climber._get_maxstep(expected)
     assert_allclose(climber._get_pfro_step(B_opt, g, a), expected,
