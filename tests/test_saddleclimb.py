@@ -12,11 +12,10 @@ import tempfile
 import copy
 
 
-def seed_streak(climber, B):
-    """Put the climber one step short of a free climb on B's negative mode."""
+def seed_previous_mode(climber, B):
+    """Put the climber where B's lowest mode follows on from the last."""
     climber._step_count = climber.min_directed_steps
     climber._prev_mode = LA.eigh(B)[1][:, 0]
-    climber._streak = climber.persistence - 1
 
 
 def generate_saddleclimb_object(interp='linear'):
@@ -49,8 +48,6 @@ def test__init__():
     assert type(climber.fmax) is float
     assert climber.maxstep
     assert type(climber.maxstep) is float
-    assert climber.delta
-    assert type(climber.delta) is float
     assert climber.logfile
     assert type(climber.logfile) is str
     assert climber.trajfile
@@ -245,9 +242,9 @@ def test_climb_guard_reads_the_gradient():
     assert not climber._is_climbing(-off, off, dxi, dxf)
 
 
-def test_tripped_guard_nulls_the_free_climb_step_and_bias_is_unguarded():
-    """A free step failing the guard keeps the lowest mode but nulls the
-    climb component; a directed step is not guarded at all.
+def test_tripped_guard_nulls_the_climb_step_free_or_directed():
+    """A step failing the guard, free or directed, keeps its climb mode
+    but nulls the climb component.
 
     Past the final endpoint and off the chord along +w, a gradient along
     +w leads away from both endpoints.
@@ -271,17 +268,14 @@ def test_tripped_guard_nulls_the_free_climb_step_and_bias_is_unguarded():
         eigs[0], eigs[1] = (5.0 if directed else -5.0), 1.0
         B = basis @ np.diag(eigs) @ basis.T
         if not directed:
-            seed_streak(climber, B)
+            seed_previous_mode(climber, B)
         B_opt = climber._get_B_opt(B, g, far)
         step = climber._get_step(B_opt, g)
         v = climber._climb_mode
         assert_allclose(abs(np.dot(v, dhat)), 1, atol=1e-10)
         assert bool(climber._free) == (not directed)
-        assert bool(climber._climbing) == directed
-        if directed:
-            assert abs(np.dot(step, v)) > 1e-6
-        else:
-            assert_allclose(np.dot(step, v), 0, atol=1e-12)
+        assert not climber._climbing
+        assert_allclose(np.dot(step, v), 0, atol=1e-12)
 
 
 def test_directed_b_opt_keeps_signs_and_prfo_climbs_convex_bias():
@@ -369,7 +363,7 @@ def test_tripped_guard_is_a_one_off():
     eigs = np.full(n, 10.0)
     eigs[0] = -5.0
     B = basis @ np.diag(eigs) @ basis.T
-    seed_streak(climber, B)
+    seed_previous_mode(climber, B)
 
     # Past the final endpoint, a gradient along +w leads away from both.
     far = climber._pos_i_1D + 1.3 * chord + 0.5 * w
@@ -384,18 +378,15 @@ def test_tripped_guard_is_a_one_off():
     assert climbing == [True, False, True, True]
 
 
-def test_free_needs_a_persistent_lowest_mode():
-    """Free only after ``persistence`` steps with a persistent lowest mode.
+def test_free_follows_the_previous_lowest_mode():
+    """Free when the lowest eigenvalue is negative and the last step's
+    lowest mode, negative or not, overlaps most with this one.
 
-    Each of the last ``persistence`` steps needs a negative lowest
-    eigenvalue, and each one's lowest mode must overlap most with the
-    next one's.  Further negative modes are ignored; a different lowest
-    mode or none start the count over, and ``min_directed_steps`` holds
-    the climb directed whatever the streak.
+    Further negative modes are ignored, a different lowest mode starts
+    over, and ``min_directed_steps`` holds the climb directed.
     """
     climber = generate_saddleclimb_object()
     climber.min_directed_steps = 0
-    climber.persistence = 3
     idx = climber.indices
     n = 3 * len(idx)
     climber._pos_i_1D = climber.atoms_initial.positions[idx, :].reshape(-1)
@@ -415,37 +406,32 @@ def test_free_needs_a_persistent_lowest_mode():
     def free_after(B, step_count=100):
         climber._step_count = step_count
         climber._get_B_opt(B, g, pos_1D)
-        return bool(climber._free), climber._streak
+        return bool(climber._free)
 
+    # Nothing to follow on the first step.
     B = hessian([0])
-    assert free_after(B) == (False, 1)
-    assert free_after(B) == (False, 2)
-    assert free_after(B) == (True, 3)
-    assert free_after(B) == (True, 4)
+    assert not free_after(B)
+    assert free_after(B)
+    assert free_after(B)
 
-    # A second, shallower negative mode is ignored: the count goes on.
-    B2 = hessian([0, 1])
-    B2 = B2 + 4.0 * np.outer(basis[:, 1], basis[:, 1])
-    assert free_after(B2) == (True, 5)
+    # A second, shallower negative mode is ignored.
+    B2 = hessian([0, 1]) + 4.0 * np.outer(basis[:, 1], basis[:, 1])
+    assert free_after(B2)
 
     # A different lowest mode follows on from nothing.
-    assert free_after(hessian([1])) == (False, 1)
-    assert free_after(hessian([1])) == (False, 2)
-    assert free_after(hessian([1])) == (True, 3)
+    assert not free_after(hessian([1]))
+    assert free_after(hessian([1]))
 
-    # No negative mode at all.
-    assert free_after(hessian([1], 1.0)) == (False, 0)
+    # A positive lowest eigenvalue is never free, but its mode is kept,
+    # so a negative lowest mode that follows it is free at once.
+    assert not free_after(hessian([1], 1.0))
+    assert free_after(hessian([1]))
 
-    # min_directed_steps holds the climb directed while the streak builds.
+    # min_directed_steps holds the climb directed.
     climber.min_directed_steps = 5
-    assert free_after(B, step_count=0) == (False, 1)
-    assert free_after(B, step_count=0) == (False, 2)
-    assert free_after(B, step_count=0) == (False, 3)
-    assert free_after(B, step_count=climber.min_directed_steps) == (True, 4)
-
-    with pytest.raises(ValueError):
-        SaddleClimb(climber.atoms_initial, climber.atoms_final, EMT(),
-                    persistence=0)
+    assert not free_after(B, step_count=0)
+    assert not free_after(B, step_count=0)
+    assert free_after(B, step_count=climber.min_directed_steps)
 
 
 def directed_setup(interp, scale=0.2):
