@@ -27,6 +27,7 @@ class SaddleClimb:
 
             hessian_scale: float = 50,
             min_directed_steps: int = 8,
+            persistence: int = 3,
             maxstep: float = 0.15,
 
             min_travel: float = 0.1,
@@ -52,6 +53,10 @@ class SaddleClimb:
             raise ValueError('min_directed_steps must not be negative, '
                              f'got {min_directed_steps}')
         self.min_directed_steps = min_directed_steps
+        if not persistence >= 1:
+            raise ValueError('persistence must be at least 1, '
+                             f'got {persistence}')
+        self.persistence = persistence
         self.a_max = a_max
         self.max_scaling_halvings = max_scaling_halvings
         self.logfile = logfile
@@ -62,6 +67,7 @@ class SaddleClimb:
         self._path = None
         self._step_count = 0
         self._prev_mode = None
+        self._streak = 0
         self._get_moving_atoms()
         if self.target_indices:
             self._get_sub_target_atoms()
@@ -191,20 +197,26 @@ class SaddleClimb:
             v = -v
         return not (np.dot(v, dxi) < 0 and np.dot(v, dxf) < 0)
 
-    def _follows_previous_mode(self, vecs):
+    def _update_streak(self, eigs, vecs):
         """
-        Whether this step's lowest mode follows on from the last one's.
+        Count consecutive steps with a persistent lowest mode.
 
-        The last step's lowest mode, negative or not, is dotted with
-        each current eigenvector; it is followed when the lowest
-        current mode has the largest absolute overlap (absolute, so
-        eigenvector signs do not matter).  This step's lowest mode is
-        stored for the next step.
+        A step extends the streak when the lowest eigenvalue of B is
+        negative and the last step's lowest mode, dotted with each
+        current eigenvector, overlaps most with this step's lowest
+        mode (absolute dot products, so eigenvector signs do not
+        matter).  A step with a negative lowest eigenvalue that does
+        not follow on from the last starts a new streak of one, and a
+        step with none resets it to zero.  Other negative eigenvalues
+        are ignored.
         """
+        if not eigs[0] < 0:
+            self._prev_mode, self._streak = None, 0
+            return
         follows = (self._prev_mode is not None
                    and np.argmax(np.abs(vecs.T @ self._prev_mode)) == 0)
+        self._streak = self._streak + 1 if follows else 1
         self._prev_mode = vecs[:, 0]
-        return bool(follows)
 
     def _get_B_opt(self, B, g, pos_1D):
         """
@@ -215,10 +227,11 @@ class SaddleClimb:
         lowest across it, and it climbs a convex mode only if it sees
         that mode's true, positive curvature.  The first
         ``min_directed_steps`` steps are always directed.  After that a
-        step is free when the lowest eigenvalue of B is negative and
-        the last step's lowest mode, negative or not, overlaps most
-        with this step's lowest mode (see ``_follows_previous_mode``).
-        B is then used as it is and its lowest mode is climbed.
+        step is free when the last ``persistence`` steps, this one
+        included, each had a negative lowest eigenvalue, and each
+        one's lowest mode overlapped most with the next one's lowest
+        mode (see ``_update_streak``).  B is then used as it
+        is and its lowest mode is climbed.
         Otherwise the step is directed: the bias is decoupled from the
         rest of B and climbed.
         A step, free or directed, whose climb mode (the lowest mode, or
@@ -231,9 +244,9 @@ class SaddleClimb:
         dxi = self._pos_i_1D - pos_1D
         dxf = self._pos_f_1D - pos_1D
         eigs_B, vecs_B = LA.eigh(B)
-        follows = self._follows_previous_mode(vecs_B)
+        self._update_streak(eigs_B, vecs_B)
         free = (self._step_count >= self.min_directed_steps
-                and eigs_B[0] < 0 and follows)
+                and self._streak >= self.persistence)
         self._path = None
         self._pos_cur = pos_1D
         if free:
@@ -584,6 +597,8 @@ class SaddleClimb:
             self._step_count = n
             prev = self._restart_trajectory.info.get('saddleclimb_prev_mode')
             self._prev_mode = None if prev is None else np.array(prev)
+            self._streak = self._restart_trajectory.info.get(
+                'saddleclimb_streak', 0)
             B_opt = self._get_B_opt(B, g, pos_1D)
             dx_1D = self._get_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
@@ -604,7 +619,7 @@ class SaddleClimb:
             Fmax = LA.norm(-g.reshape(-1, 3), axis=1).max()
             B = self._update_hessian(B, dg, dx_1D)
             self._step_count = n
-            prev_mode = self._prev_mode
+            prev_mode, streak = self._prev_mode, self._streak
             B_opt = self._get_B_opt(B, g, pos_1D)
             dx_1D = self._get_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
@@ -614,6 +629,7 @@ class SaddleClimb:
             atoms.info["saddleclimb_hessian"] = B.tolist()
             atoms.info["saddleclimb_hessian_shape"] = B.shape
             atoms.info['saddleclimb_iterations'] = n + 0
+            atoms.info['saddleclimb_streak'] = int(streak)
             if prev_mode is None:
                 atoms.info.pop('saddleclimb_prev_mode', None)
             else:
