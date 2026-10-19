@@ -26,9 +26,9 @@ class SaddleClimb:
             interp: str = 'qst',
 
             hessian_scale: float = 50,
-            min_directed_steps: int = 8,
-            persistence: int = 3,
-            maxstep: float = 0.15,
+            min_directed_steps: int = 6,
+            persistence: int = 2,
+            maxstep: float = 0.2,
 
             min_travel: float = 0.1,
             a_max: float = 1,
@@ -307,23 +307,21 @@ class SaddleClimb:
         smin = (a / svecs_min[-1, 0]) * svecs_min[0:Ndim-1, 0]
         return mult(vmin, smin)
 
-    def _get_path_climb(self, B_opt, g, vmin, a):
+    def _get_path_climb(self, B_opt, g, a):
         """
-        Climb step as a function of the scaling, solved in path space.
+        Climb step as a function of the scaling, along a fixed direction.
 
         The gradient and Hessian are projected onto the path tangent and
-        the P-RFO maximum at each scaling gives ``f*``, kept between the
-        end structures.  The climb is the path structure at ``f*`` minus
-        the current one, so it bends with the path.
-
-        The path is solved few times.  A search with the straight line
-        along the tangent places ``f*`` first, the path is solved there
-        once, and a polynomial in ``f`` through that and the structures
-        already known (the current one and the two that gave the
-        tangent) stands in for the path while the scaling is searched.
-        With an explicit ``a`` the path is solved at ``f*`` itself.
+        the P-RFO maximum at ``a_max`` gives ``f*``, kept between the end
+        structures.  The path is solved once there, and the Cartesian
+        direction from the current structure to it is the climb
+        direction for every scaling.  P-RFO is solved along that
+        direction in Cartesian space, so shrinking the scaling shortens
+        the step along the same line rather than bending it along the
+        path.  With an explicit ``a`` the path is solved at ``f*`` for
+        that ``a`` itself.
         """
-        f, t, nodes, path_at = self._path
+        f, t, _, path_at = self._path
         G_f, H_f = t @ g, t @ B_opt @ t
         x0 = self._pos_cur
 
@@ -334,25 +332,16 @@ class SaddleClimb:
         if a is not None:
             return lambda scale: path_at(f_star(scale)) - x0
 
-        def descend(scale):
-            return self._get_scaled_descend_step(B_opt, g, vmin, scale)
-
-        scale0 = self._get_pfro_scaling(
-            lambda scale: (f_star(scale) - f) * t + descend(scale),
-            self.maxstep)
-        f0 = f_star(scale0)
-        if all(abs(f0 - known) > 1e-6 for known in nodes):
-            nodes = {**nodes, f0: path_at(f0)}
-        fs = np.array(sorted(nodes))
-        xs = np.array([nodes[k] for k in fs])
-
-        def climb(scale):
-            x = f_star(scale)
-            weights = [np.prod([(x - fj) / (fi - fj)
-                                for fj in fs if fj != fi]) for fi in fs]
-            return np.tensordot(weights, xs, axes=1) - x0
-
-        return climb
+        # f* at a_max, solved on the path once, fixes the Cartesian
+        # direction.  P-RFO is then solved along that direction in
+        # Cartesian space, so shrinking the scaling only shortens the
+        # step along the same line.
+        dx_max = self._hold_non_targets(path_at(f_star(self.a_max)) - x0)
+        norm = LA.norm(dx_max)
+        if norm == 0:
+            return lambda scale: np.zeros_like(g)
+        return lambda scale: self._get_scaled_climb_step(
+            B_opt, g, dx_max / norm, scale)
 
     def _get_pfro_scaling(self, component, radius):
         """
@@ -421,9 +410,7 @@ class SaddleClimb:
         vmin = basis[:, 1:]
 
         if self.path_climb and self._path is not None:
-            # vmin here only bootstraps the path polynomial; the
-            # descent used in the step is the one below.
-            climb = (self._get_path_climb(B_opt, g, vmin, a)
+            climb = (self._get_path_climb(B_opt, g, a)
                      if self._climbing
                      else lambda scale: np.zeros_like(g))
         else:
@@ -537,18 +524,17 @@ class SaddleClimb:
         """
         self._pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
         self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
-        _, t, _, path_at = self._get_path_frame(self._pos_i_1D)
-        f = min(self.maxstep / self._get_maxstep(t), 1.0)
-        for _ in range(3):
-            dx_1D = self._hold_non_targets(path_at(f) - self._pos_i_1D)
-            length = self._get_maxstep(dx_1D)
-            if abs(length - self.maxstep) < 1e-3 * self.maxstep or f >= 1.0:
-                break
-            f = min(f * self.maxstep / length, 1.0)
-        # Held atoms are zeroed first, so maxstep is the length
-        # of the step actually taken, in the same units as the
-        # trust radii.
-        dx_1D = self.maxstep * dx_1D / self._get_maxstep(dx_1D)
+        _, _, _, path_at = self._get_path_frame(self._pos_i_1D)
+
+        def excess(f):
+            return self._get_maxstep(self._hold_non_targets(
+                path_at(f) - self._pos_i_1D)) - self.maxstep
+
+        # The step is the path structure itself, not a chord to it, so
+        # it lies on the path.  If even the product is closer than
+        # maxstep, the step is the whole path.
+        f = 1.0 if excess(1.0) <= 0 else brentq(excess, 0.0, 1.0, xtol=1e-8)
+        dx_1D = self._hold_non_targets(path_at(f) - self._pos_i_1D)
         return dx_1D.reshape(-1, 3), dx_1D
 
     def _get_log_string(self, n, E, Fmax):
