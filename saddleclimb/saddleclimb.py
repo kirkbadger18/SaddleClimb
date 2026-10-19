@@ -7,6 +7,7 @@ from ase.atoms import Atoms
 from ase.calculators.calculator import Calculator
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io.trajectory import Trajectory
+from numpy.polynomial import Polynomial
 from scipy.optimize import brentq, minimize
 from ase.geometry import find_mic
 from pathlib import Path
@@ -25,10 +26,10 @@ class SaddleClimb:
             trajfile: str = 'climb.traj',
             interp: str = 'qst',
 
-            hessian_scale: float = 50,
-            min_directed_steps: int = 6,
-            persistence: int = 2,
-            maxstep: float = 0.2,
+            hessian_scale: float = 25,
+            min_directed_steps: int = 8,
+            persistence: int = 3,
+            maxstep: float = 0.15,
 
             min_travel: float = 0.1,
             a_max: float = 1,
@@ -68,6 +69,9 @@ class SaddleClimb:
         self._step_count = 0
         self._prev_mode = None
         self._streak = 0
+        self._E_initial = None
+        self._E_final = None
+        self._E_cur = None
         self._get_moving_atoms()
         if self.target_indices:
             self._get_sub_target_atoms()
@@ -307,19 +311,65 @@ class SaddleClimb:
         smin = (a / svecs_min[-1, 0]) * svecs_min[0:Ndim-1, 0]
         return mult(vmin, smin)
 
+    def _get_path_energy_max(self, f, G_f):
+        """
+        Path variable of the energy maximum along the path, or None.
+
+        The energy along the path is modelled by a polynomial whose
+        slope is ``f (1 - f) (f* - f) (r0 + r1 f)`` with ``r0 + r1 f``
+        positive on [0, 1]: flat at both ends (the minima), and with
+        exactly one stationary point inside, a maximum at ``f*``.  The
+        three parameters ``f*, r0, r1`` are fitted to the three numbers
+        known: the energy of the final structure and the energy ``E``
+        and slope ``G_f`` of the current one at ``f``, all relative to
+        the initial structure.  Returns None if the fit fails or an
+        energy is not known yet.
+        """
+        if None in (self._E_initial, self._E_final, self._E_cur):
+            return None
+        E = self._E_cur - self._E_initial
+        E_P = self._E_final - self._E_initial
+        scale = max(abs(E), abs(E_P), 1e-3)
+
+        def slope(x):
+            fs, r0, r1 = x
+            return Polynomial([0, 1, -1]) * Polynomial([fs, -1]) \
+                * Polynomial([r0, r1])
+
+        def residuals(x):
+            dE = slope(x)
+            E_model = dE.integ()
+            return np.array([E_model(1) - E_P, E_model(f) - E,
+                             dE(f) - G_f]) / scale
+
+        best = None
+        for f0 in (0.3, 0.5, 0.7):
+            res = minimize(
+                lambda x: np.sum(residuals(x)**2), [f0, 30 * scale, 0.0],
+                method='SLSQP', bounds=[(0.01, 0.99), (1e-9, None),
+                                        (None, None)],
+                constraints=[{'type': 'ineq',
+                              'fun': lambda x: x[1] + x[2] - 1e-9}],
+                options={'maxiter': 500, 'ftol': 1e-14})
+            if np.isfinite(res.fun) and (best is None or res.fun < best.fun):
+                best = res
+        return None if best is None else float(best.x[0])
+
     def _get_path_climb(self, B_opt, g, a):
         """
         Climb step as a function of the scaling, along a fixed direction.
 
-        The gradient and Hessian are projected onto the path tangent and
-        the P-RFO maximum at ``a_max`` gives ``f*``, kept between the end
-        structures.  The path is solved once there, and the Cartesian
-        direction from the current structure to it is the climb
-        direction for every scaling.  P-RFO is solved along that
+        The energy maximum on the path, ``f*``, is fitted from the end
+        energies and the energy and slope here (see
+        ``_get_path_energy_max``); if that fails it is the P-RFO maximum
+        along the path variable at ``a_max``, kept between the end
+        structures.  The path is solved once at ``f*``, and the
+        Cartesian direction from the current structure to it is the
+        climb direction for every scaling.  P-RFO is solved along that
         direction in Cartesian space, so shrinking the scaling shortens
         the step along the same line rather than bending it along the
-        path.  With an explicit ``a`` the path is solved at ``f*`` for
-        that ``a`` itself.
+        path.  With an explicit ``a`` the path is solved at the P-RFO
+        ``f*`` for that ``a`` itself.
         """
         f, t, _, path_at = self._path
         G_f, H_f = t @ g, t @ B_opt @ t
@@ -332,11 +382,10 @@ class SaddleClimb:
         if a is not None:
             return lambda scale: path_at(f_star(scale)) - x0
 
-        # f* at a_max, solved on the path once, fixes the Cartesian
-        # direction.  P-RFO is then solved along that direction in
-        # Cartesian space, so shrinking the scaling only shortens the
-        # step along the same line.
-        dx_max = self._hold_non_targets(path_at(f_star(self.a_max)) - x0)
+        f_max = self._get_path_energy_max(f, G_f)
+        if f_max is None:
+            f_max = f_star(self.a_max)
+        dx_max = self._hold_non_targets(path_at(f_max) - x0)
         norm = LA.norm(dx_max)
         if norm == 0:
             return lambda scale: np.zeros_like(g)
@@ -502,6 +551,12 @@ class SaddleClimb:
         self._log(log_string)
         return traj, g_init, E_init
 
+    def _get_final_energy(self):
+        """Energy of the final structure, one extra calculation."""
+        final = self.atoms_final.copy()
+        final.calc = self.calculator
+        return final.get_potential_energy()
+
     def _initialize_run_restart(self: None, idx: list):
         traj = Trajectory(self.trajfile, 'a')
         g_tot = -self._restart_trajectory.calc.results['forces']
@@ -581,6 +636,15 @@ class SaddleClimb:
             pos_1D = atoms.positions[idx, :].reshape(-1)
             dxi = self._get_maxstep(self._pos_i_1D - pos_1D)
             self._step_count = n
+            info = self._restart_trajectory.info
+            self._E_initial = info.get('saddleclimb_E_initial')
+            self._E_final = info.get('saddleclimb_E_final')
+            if self._E_initial is None or self._E_final is None:
+                first = self.atoms_initial.copy()
+                first.calc = self.calculator
+                self._E_initial = first.get_potential_energy()
+                self._E_final = self._get_final_energy()
+            self._E_cur = E
             prev = self._restart_trajectory.info.get('saddleclimb_prev_mode')
             self._prev_mode = None if prev is None else np.array(prev)
             self._streak = self._restart_trajectory.info.get(
@@ -592,6 +656,8 @@ class SaddleClimb:
             atoms, idx, B = self._initialize_atoms()
             traj, g, E = self._initialize_run(atoms, idx)
             dx, dx_1D = self._get_initial_step(idx)
+            self._E_initial = E
+            self._E_final = self._get_final_energy()
             Fmax, dxi, n = 1, 0, 0
         while Fmax > self.fmax or dxi < self.min_travel:
             atoms.positions[idx, :] += dx
@@ -605,6 +671,7 @@ class SaddleClimb:
             Fmax = LA.norm(-g.reshape(-1, 3), axis=1).max()
             B = self._update_hessian(B, dg, dx_1D)
             self._step_count = n
+            self._E_cur = E
             prev_mode, streak = self._prev_mode, self._streak
             B_opt = self._get_B_opt(B, g, pos_1D)
             dx_1D = self._get_step(B_opt, g)
@@ -615,6 +682,8 @@ class SaddleClimb:
             atoms.info["saddleclimb_hessian"] = B.tolist()
             atoms.info["saddleclimb_hessian_shape"] = B.shape
             atoms.info['saddleclimb_iterations'] = n + 0
+            atoms.info['saddleclimb_E_initial'] = float(self._E_initial)
+            atoms.info['saddleclimb_E_final'] = float(self._E_final)
             atoms.info['saddleclimb_streak'] = int(streak)
             if prev_mode is None:
                 atoms.info.pop('saddleclimb_prev_mode', None)
