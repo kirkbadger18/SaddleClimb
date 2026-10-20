@@ -26,10 +26,10 @@ class SaddleClimb:
             trajfile: str = 'climb.traj',
             interp: str = 'qst',
 
-            hessian_scale: float = 25,
+            hessian_scale: float = 10,
             min_directed_steps: int = 8,
             persistence: int = 3,
-            maxstep: float = 0.15,
+            maxstep: float = 0.1,
 
             min_travel: float = 0.1,
             a_max: float = 1,
