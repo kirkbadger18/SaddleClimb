@@ -236,10 +236,13 @@ class SaddleClimb:
         one's lowest mode overlapped most with the next one's lowest
         mode (see ``_update_streak``).  B is then used as it
         is and its lowest mode is climbed.
-        Otherwise the step is directed: the bias is decoupled from the
-        rest of B and climbed.
+        Otherwise the step is directed: the climb direction is the
+        chord to the energy maximum ``f*`` on the path (see
+        ``_get_climb_direction``), and it is decoupled from the rest of
+        B, so it is an exact eigenvector of the returned Hessian.
         A step, free or directed, whose climb mode (the lowest mode, or
-        the bias), oriented uphill, points away from both ends trips the
+        the chord to ``f*``), oriented uphill, points away from both
+        ends trips the
         guard: ``_climbing`` is cleared and the climb component of that
         step is nulled, leaving the descent across the climb mode.  The
         guard affects only the step it trips on.  The climb mode is
@@ -257,8 +260,8 @@ class SaddleClimb:
             B_opt, v = B, vecs_B[:, 0]
         else:
             self._path = self._get_path_frame(pos_1D)
-            bias = self._path[1]
-            B_opt, v = self._get_directed_hessian(B, bias / LA.norm(bias))
+            B_opt, v = self._get_directed_hessian(
+                B, self._get_climb_direction(B, g, pos_1D))
         self._climbing = self._is_climbing(v, g, dxi, dxf)
         self._climb_mode = v
         self._free = free
@@ -347,42 +350,47 @@ class SaddleClimb:
                 best = res
         return None if best is None else float(best.x[0])
 
-    def _get_path_climb(self, B_opt, g, a):
+    def _get_climb_direction(self, B, g, pos_1D):
         """
-        Climb step as a function of the scaling, along a fixed direction.
+        Unit climb direction of a directed step: the chord from the
+        current structure to the path structure at ``f*``.
 
-        The energy maximum on the path, ``f*``, is fitted from the end
+        ``f*`` is the energy maximum along the path, fitted from the end
         energies and the energy here (see ``_get_path_energy_max``); if
-        that fails it is the P-RFO maximum
-        along the path variable at ``a_max``, kept between the end
-        structures.  The path is solved once at ``f*``, and the
-        Cartesian direction from the current structure to it is the
-        climb direction for every scaling.  P-RFO is solved along that
-        direction in Cartesian space, so shrinking the scaling shortens
-        the step along the same line rather than bending it along the
-        path.  With an explicit ``a`` the path is solved at the P-RFO
-        ``f*`` for that ``a`` itself.
+        that fails it is the P-RFO maximum along the path variable at
+        ``a_max``, kept between the end structures.  The path is solved
+        once, at ``f*``.  With ``path_climb`` off, or when ``f*`` is
+        where the structure already is, the direction is the path
+        tangent.
+        """
+        f, t, _, path_at = self._path
+        tangent = t / LA.norm(t)
+        if not self.path_climb:
+            return tangent
+        f_max = self._get_path_energy_max(f)
+        if f_max is None:
+            f_max = np.clip(f + self._get_scaled_path_step(
+                t @ B @ t, t @ g, self.a_max), 0, 1)
+        dx = self._hold_non_targets(path_at(f_max) - pos_1D)
+        norm = LA.norm(dx)
+        return tangent if norm == 0 else dx / norm
+
+    def _get_path_climb(self, B_opt, g):
+        """
+        Climb step for an explicit scaling, solved in path space.
+
+        The gradient and Hessian are projected onto the path tangent and
+        the P-RFO maximum at the scaling gives ``f*``, kept between the
+        end structures.  The climb is the path structure at ``f*``
+        minus the current one, so it bends with the path.  The searched
+        step does not use this: it climbs along the fixed direction from
+        ``_get_climb_direction``.
         """
         f, t, _, path_at = self._path
         G_f, H_f = t @ g, t @ B_opt @ t
         x0 = self._pos_cur
-
-        def f_star(scale):
-            return np.clip(
-                f + self._get_scaled_path_step(H_f, G_f, scale), 0, 1)
-
-        if a is not None:
-            return lambda scale: path_at(f_star(scale)) - x0
-
-        f_max = self._get_path_energy_max(f)
-        if f_max is None:
-            f_max = f_star(self.a_max)
-        dx_max = self._hold_non_targets(path_at(f_max) - x0)
-        norm = LA.norm(dx_max)
-        if norm == 0:
-            return lambda scale: np.zeros_like(g)
-        return lambda scale: self._get_scaled_climb_step(
-            B_opt, g, dx_max / norm, scale)
+        return lambda scale: path_at(np.clip(
+            f + self._get_scaled_path_step(H_f, G_f, scale), 0, 1)) - x0
 
     def _get_pfro_scaling(self, component, radius):
         """
@@ -425,32 +433,31 @@ class SaddleClimb:
     def _get_pfro_step(self, B_opt, g, a=None):
         """
         Partitioned RFO step: maximized along the climb, minimized in
-        the space across it.  On a directed step with ``path_climb``
-        the maximum is solved in the path variable ``f`` (see
-        ``_get_path_climb``).  The climb and the descent each get their
-        own scaling, ``a_climb`` and ``a_descend``, each reduced from
-        ``a_max`` only until its own step is within ``maxstep``.  The
-        sum is then scaled down onto ``maxstep`` if it is longer, and
-        left alone if it is not.  With an explicit ``a`` both use it
-        and the search is skipped.
+        the space across it.  The climb is along the fixed climb mode
+        ``_climb_mode`` (on a directed step the chord to ``f*``, see
+        ``_get_climb_direction``), an exact eigenvector of ``B_opt``,
+        so shrinking the scaling shortens the step along the same line.
+        One scaling is solved for the whole step against the single
+        trust radius ``maxstep``, and both partitions use it.  With an
+        explicit ``a`` the search is skipped, and on a directed step
+        with ``path_climb`` the climb is instead the path structure at
+        the ``f*`` of that ``a`` (see ``_get_path_climb``).  The linear
+        truncation is kept as a safety net: the bracket is closed only
+        to ``xtol`` in log(a), and for the case where no bracket could
+        be found at all.
 
-        The space the descent runs in is spanned across the climb step
-        that is actually taken, not across the climb mode.  On a path
-        climb the step is the chord to the path structure at ``f*``, so
-        it bends away from the tangent; splitting on the tangent would
-        leave that bend inside the descent space, where the descent
-        would then be solved as if the climb had not moved there.  The
-        chord depends on the scaling, so its complement is rebuilt at
-        every scaling tried -- one QR per trial, no force evaluations.
-        The tangent is still what the gradient and Hessian are
-        projected on to get ``f*``.
+        The descent runs across the climb step that is actually taken.
+        On the searched step that is the complement of the climb mode;
+        with an explicit ``a`` on the path the chord bends away from the
+        tangent, so the complement is rebuilt at every scaling tried --
+        one QR per trial, no force evaluations.
         """
         vmax = self._climb_mode
         basis, _ = LA.qr(vmax.reshape(-1, 1), mode='complete')
         vmin = basis[:, 1:]
 
-        if self.path_climb and self._path is not None:
-            climb = (self._get_path_climb(B_opt, g, a)
+        if a is not None and self.path_climb and self._path is not None:
+            climb = (self._get_path_climb(B_opt, g)
                      if self._climbing
                      else lambda scale: np.zeros_like(g))
         else:
@@ -468,16 +475,13 @@ class SaddleClimb:
                 across = frame[:, 1:]
             return self._get_scaled_descend_step(B_opt, g, across, scale)
 
-        if a is None:
-            a_climb = self._get_pfro_scaling(climb, self.maxstep)
-            climb_step = climb(a_climb)
-            a_descend = self._get_pfro_scaling(
-                lambda scale: descend_across(climb_step, scale),
-                self.maxstep)
-        else:
-            a_climb = a_descend = a
-            climb_step = climb(a)
-        step = climb_step + descend_across(climb_step, a_descend)
+        def total(scale):
+            climb_step = climb(scale)
+            return climb_step + descend_across(climb_step, scale)
+
+        scale = (a if a is not None
+                 else self._get_pfro_scaling(total, self.maxstep))
+        step = total(scale)
         stepsize = self._get_maxstep(step)
         if stepsize > self.maxstep:
             step = step * (self.maxstep / stepsize)

@@ -149,14 +149,13 @@ def test_initialize_atoms():
     assert_allclose(climber.hessian, B_test)
 
 
-def test_pfro_scales_climb_and_descent_separately_then_the_sum():
-    """Each part is reduced alone to fit maxstep; the sum only if longer.
+def test_pfro_uses_one_scaling_for_climb_and_descent():
+    """One scaling is solved on the whole step and both parts use it.
 
-    A soft climb mode with a large gradient along it forces the climb
-    scaling below a_max, while the descent, which fits unscaled, keeps
-    a_max.  The climb alone is brought to maxstep, and the sum of the
-    two is scaled down onto maxstep only if it is longer.  With a small
-    gradient nothing exceeds maxstep and the step is the plain sum.
+    A soft climb mode with a large gradient along it forces the scaling
+    below a_max, and the descent, which would fit unscaled, is scaled
+    down with it.  The step is the sum of both parts at that one scaling
+    and reaches maxstep.
     """
     climber = generate_saddleclimb_object()
     rng = np.random.default_rng(3)
@@ -165,6 +164,7 @@ def test_pfro_scales_climb_and_descent_separately_then_the_sum():
     eigs = np.concatenate(([-0.5], rng.uniform(5, 30, n - 1)))
     B_opt = Q @ np.diag(eigs) @ Q.T
     vmax, vmin = Q[:, 0], Q[:, 1:]
+    g = 3.0 * vmax + 0.01 * vmin @ rng.standard_normal(n - 1)
     climber._climb_mode = vmax
 
     def climb(a):
@@ -173,27 +173,19 @@ def test_pfro_scales_climb_and_descent_separately_then_the_sum():
     def descend(a):
         return climber._get_scaled_descend_step(B_opt, g, vmin, a)
 
-    g = 3.0 * vmax + 0.3 * vmin @ rng.standard_normal(n - 1)
     assert climber._get_maxstep(climb(climber.a_max)) > climber.maxstep
     assert climber._get_maxstep(descend(climber.a_max)) < climber.maxstep
-    a_climb = climber._get_pfro_scaling(climb, climber.maxstep)
-    assert a_climb < climber.a_max
-    assert_allclose(climber._get_maxstep(climb(a_climb)), climber.maxstep,
-                    rtol=1e-2)
-    plain = climb(a_climb) + descend(climber.a_max)
+    a = climber._get_pfro_scaling(lambda s: climb(s) + descend(s),
+                                  climber.maxstep)
+    assert a < climber.a_max
 
     step = climber._get_pfro_step(B_opt, g)
-    longest = max(climber._get_maxstep(plain), climber.maxstep)
-    assert_allclose(step, plain * climber.maxstep / longest,
-                    rtol=1e-2, atol=1e-3)
+    assert_allclose(climber._get_maxstep(step), climber.maxstep, rtol=1e-2)
     assert climber._get_maxstep(step) <= climber.maxstep + 1e-9
-
-    g = 0.01 * vmax + 0.001 * vmin @ rng.standard_normal(n - 1)
-    assert climber._get_maxstep(climb(climber.a_max)) < climber.maxstep
-    step = climber._get_pfro_step(B_opt, g)
-    assert climber._get_maxstep(step) < climber.maxstep
-    assert_allclose(step, climb(climber.a_max) + descend(climber.a_max),
-                    rtol=1e-2, atol=1e-6)
+    assert_allclose(step, climb(a) + descend(a), rtol=1e-2, atol=1e-3)
+    across = step - np.dot(step, vmax) * vmax
+    assert climber._get_maxstep(across) < climber._get_maxstep(
+        descend(climber.a_max))
 
 
 def test_pfro_step_nulls_ascent_when_not_climbing():
@@ -494,8 +486,6 @@ def test_path_climb_with_given_alpha_is_the_path_structure_at_f_star(interp):
     B_opt = climber._get_B_opt(B, g, pos)
     assert not climber._free
     f, t, nodes, path_at = climber._path
-    assert_allclose(abs(climber._climb_mode @ climber.normalize(t)), 1,
-                    atol=1e-10)
     a = 0.15
     f_star = np.clip(f + climber._get_scaled_path_step(
         t @ B_opt @ t, t @ g, a), 0, 1)
@@ -562,3 +552,42 @@ def test_path_climb_off_gives_the_straight_climb():
     assert_allclose(climber._get_pfro_step(B_opt, g, a), expected,
                     atol=1e-12)
 
+
+
+@pytest.mark.parametrize('interp', ['linear', 'qst'])
+def test_directed_climb_mode_is_the_chord_to_f_star_and_an_eigenvector(interp):
+    """The climb mode is the chord to ``f*`` and an eigenvector of B_opt.
+
+    Without energies ``f*`` is the P-RFO maximum along the path at
+    ``a_max``.  The climb mode is the unit chord from the current
+    structure to the path structure there, and the congruence transform
+    leaves it an exact eigenvector with its own curvature.
+    """
+    climber, B, g, pos = directed_setup(interp)
+    B_opt = climber._get_B_opt(B, g, pos)
+    f, t, nodes, path_at = climber._path
+    f_star = np.clip(f + climber._get_scaled_path_step(
+        t @ B @ t, t @ g, climber.a_max), 0, 1)
+    chord = path_at(f_star) - pos
+    v = climber._climb_mode
+    assert_allclose(abs(v @ chord) / LA.norm(chord), 1, atol=1e-10)
+    assert_allclose(B_opt @ v, (v @ B @ v) * v, atol=1e-10)
+
+
+@pytest.mark.parametrize('interp', ['linear', 'qst'])
+def test_shrinking_alpha_keeps_the_climb_direction(interp):
+    """A smaller trust radius shortens the climb along the same line."""
+    climber, B, g, pos = directed_setup(interp)
+    g = 8 * g
+    B_opt = climber._get_B_opt(B, g, pos)
+    v = climber._climb_mode
+    climbs = []
+    for maxstep in (0.4, 0.1, 0.03):
+        climber.maxstep = maxstep
+        step = climber._get_pfro_step(B_opt, g)
+        assert climber._get_maxstep(step) <= maxstep + 1e-9
+        climbs.append(np.dot(step, v) * v)
+    for c in climbs[1:]:
+        assert_allclose(abs(c @ climbs[0]) / (LA.norm(c) * LA.norm(climbs[0])),
+                        1, atol=1e-9)
+    assert LA.norm(climbs[2]) < LA.norm(climbs[1]) < LA.norm(climbs[0])
