@@ -26,10 +26,10 @@ class SaddleClimb:
             trajfile: str = 'climb.traj',
             interp: str = 'qst',
 
-            hessian_scale: float = 10,
-            min_directed_steps: int = 8,
+            hessian_scale: float = 20,
+            min_directed_steps: int = 6,
             persistence: int = 3,
-            maxstep: float = 0.1,
+            maxstep: float = 0.2,
 
             min_travel: float = 0.1,
             a_max: float = 1,
@@ -311,19 +311,19 @@ class SaddleClimb:
         smin = (a / svecs_min[-1, 0]) * svecs_min[0:Ndim-1, 0]
         return mult(vmin, smin)
 
-    def _get_path_energy_max(self, f, G_f):
+    def _get_path_energy_max(self, f):
         """
         Path variable of the energy maximum along the path, or None.
 
-        The energy along the path is modelled by a polynomial whose
-        slope is ``f (1 - f) (f* - f) (r0 + r1 f)`` with ``r0 + r1 f``
-        positive on [0, 1]: flat at both ends (the minima), and with
-        exactly one stationary point inside, a maximum at ``f*``.  The
-        three parameters ``f*, r0, r1`` are fitted to the three numbers
-        known: the energy of the final structure and the energy ``E``
-        and slope ``G_f`` of the current one at ``f``, all relative to
-        the initial structure.  Returns None if the fit fails or an
-        energy is not known yet.
+        The energy along the path is modelled by a quartic whose slope
+        is ``k f (1 - f) (f* - f)`` with ``k > 0``: flat at both ends
+        (the minima), and with exactly one stationary point inside, a
+        maximum at ``f*``.  The two parameters ``k, f*`` are fitted to
+        the energy of the final structure and the energy ``E`` of the
+        current one at ``f``, both relative to the initial structure.
+        The gradient is left out on purpose: it is noisy, and its exact
+        value along one direction can mislead.  Returns None if the fit
+        fails or an energy is not known yet.
         """
         if None in (self._E_initial, self._E_final, self._E_cur):
             return None
@@ -331,25 +331,17 @@ class SaddleClimb:
         E_P = self._E_final - self._E_initial
         scale = max(abs(E), abs(E_P), 1e-3)
 
-        def slope(x):
-            fs, r0, r1 = x
-            return Polynomial([0, 1, -1]) * Polynomial([fs, -1]) \
-                * Polynomial([r0, r1])
-
         def residuals(x):
-            dE = slope(x)
-            E_model = dE.integ()
-            return np.array([E_model(1) - E_P, E_model(f) - E,
-                             dE(f) - G_f]) / scale
+            fs, k = x
+            E_model = (k * Polynomial([0, 1, -1])
+                       * Polynomial([fs, -1])).integ()
+            return np.array([E_model(1) - E_P, E_model(f) - E]) / scale
 
         best = None
         for f0 in (0.3, 0.5, 0.7):
             res = minimize(
-                lambda x: np.sum(residuals(x)**2), [f0, 30 * scale, 0.0],
-                method='SLSQP', bounds=[(0.01, 0.99), (1e-9, None),
-                                        (None, None)],
-                constraints=[{'type': 'ineq',
-                              'fun': lambda x: x[1] + x[2] - 1e-9}],
+                lambda x: np.sum(residuals(x)**2), [f0, 50 * scale],
+                method='SLSQP', bounds=[(0.01, 0.99), (1e-9, None)],
                 options={'maxiter': 500, 'ftol': 1e-14})
             if np.isfinite(res.fun) and (best is None or res.fun < best.fun):
                 best = res
@@ -360,8 +352,8 @@ class SaddleClimb:
         Climb step as a function of the scaling, along a fixed direction.
 
         The energy maximum on the path, ``f*``, is fitted from the end
-        energies and the energy and slope here (see
-        ``_get_path_energy_max``); if that fails it is the P-RFO maximum
+        energies and the energy here (see ``_get_path_energy_max``); if
+        that fails it is the P-RFO maximum
         along the path variable at ``a_max``, kept between the end
         structures.  The path is solved once at ``f*``, and the
         Cartesian direction from the current structure to it is the
@@ -382,7 +374,7 @@ class SaddleClimb:
         if a is not None:
             return lambda scale: path_at(f_star(scale)) - x0
 
-        f_max = self._get_path_energy_max(f, G_f)
+        f_max = self._get_path_energy_max(f)
         if f_max is None:
             f_max = f_star(self.a_max)
         dx_max = self._hold_non_targets(path_at(f_max) - x0)
@@ -435,13 +427,12 @@ class SaddleClimb:
         Partitioned RFO step: maximized along the climb, minimized in
         the space across it.  On a directed step with ``path_climb``
         the maximum is solved in the path variable ``f`` (see
-        ``_get_path_climb``).  One scaling is solved for the whole
-        step against the single trust radius ``maxstep``, and both
-        partitions use it.  With an explicit ``a`` the
-        search is skipped.  The linear truncation is kept as a
-        safety net: the bracket is closed only to ``xtol`` in
-        log(a), and for the case where no bracket could be found
-        at all.
+        ``_get_path_climb``).  The climb and the descent each get their
+        own scaling, ``a_climb`` and ``a_descend``, each reduced from
+        ``a_max`` only until its own step is within ``maxstep``.  The
+        sum is then scaled down onto ``maxstep`` if it is longer, and
+        left alone if it is not.  With an explicit ``a`` both use it
+        and the search is skipped.
 
         The space the descent runs in is spanned across the climb step
         that is actually taken, not across the climb mode.  On a path
@@ -477,13 +468,16 @@ class SaddleClimb:
                 across = frame[:, 1:]
             return self._get_scaled_descend_step(B_opt, g, across, scale)
 
-        def total(scale):
-            climb_step = climb(scale)
-            return climb_step + descend_across(climb_step, scale)
-
-        scale = (a if a is not None
-                 else self._get_pfro_scaling(total, self.maxstep))
-        step = total(scale)
+        if a is None:
+            a_climb = self._get_pfro_scaling(climb, self.maxstep)
+            climb_step = climb(a_climb)
+            a_descend = self._get_pfro_scaling(
+                lambda scale: descend_across(climb_step, scale),
+                self.maxstep)
+        else:
+            a_climb = a_descend = a
+            climb_step = climb(a)
+        step = climb_step + descend_across(climb_step, a_descend)
         stepsize = self._get_maxstep(step)
         if stepsize > self.maxstep:
             step = step * (self.maxstep / stepsize)
@@ -776,20 +770,22 @@ class SaddleClimb:
         through their shared pairs.  `indices=None` frees every atom.
         Returns an array shaped like `atoms.positions`.
 
-        Pairs are weighted by 1/r_interp^4 + 1/r_P^4: the interpolated
-        distance as in eq. (3), plus the product distance.  The first
-        term weights a pair by how close the path wants it at this
-        point, which the endpoints alone cannot know, so an intermediate
-        image is not fitted with fragments pushed into the surface or
-        each other.  The second keeps pairs that are bonded in the
-        product weighted while they are still far apart on the path.
+        Pairs are weighted by 1/r_interp^4 + 1/r_R^4 + 1/r_P^4: the
+        interpolated distance as in eq. (3), plus the reactant and
+        product distances.  The first term weights a pair by how close
+        the path wants it at this point, which the endpoints alone
+        cannot know, so an intermediate image is not fitted with
+        fragments pushed into the surface or each other.  The other two
+        keep pairs that are bonded in the reactant, or in the product,
+        weighted while they are still far apart on the path.
         """
         free = (np.arange(len(positions_guess)) if indices is None
                 else np.asarray(indices))
         iu = np.triu_indices(len(positions_guess), k=1)
         r_i = r_interp[iu]
+        r_R = self._pair_distances(self.atoms_initial.positions)[iu]
         r_P = self._pair_distances(self.atoms_final.positions)[iu]
-        w = 1 / r_i**4 + 1 / r_P**4
+        w = 1 / r_i**4 + 1 / r_R**4 + 1 / r_P**4
         x0 = positions_guess[free].reshape(-1)
 
         def S_and_grad(x):

@@ -149,13 +149,14 @@ def test_initialize_atoms():
     assert_allclose(climber.hessian, B_test)
 
 
-def test_pfro_uses_one_scaling_for_climb_and_descent():
-    """One scaling is solved on the whole step and both parts use it.
+def test_pfro_scales_climb_and_descent_separately_then_the_sum():
+    """Each part is reduced alone to fit maxstep; the sum only if longer.
 
-    A soft climb mode with a large gradient along it forces the scaling
-    below a_max, and the descent, which would fit unscaled, is scaled
-    down with it.  The step is the sum of both parts at that one scaling
-    and reaches maxstep.
+    A soft climb mode with a large gradient along it forces the climb
+    scaling below a_max, while the descent, which fits unscaled, keeps
+    a_max.  The climb alone is brought to maxstep, and the sum of the
+    two is scaled down onto maxstep only if it is longer.  With a small
+    gradient nothing exceeds maxstep and the step is the plain sum.
     """
     climber = generate_saddleclimb_object()
     rng = np.random.default_rng(3)
@@ -164,7 +165,6 @@ def test_pfro_uses_one_scaling_for_climb_and_descent():
     eigs = np.concatenate(([-0.5], rng.uniform(5, 30, n - 1)))
     B_opt = Q @ np.diag(eigs) @ Q.T
     vmax, vmin = Q[:, 0], Q[:, 1:]
-    g = 3.0 * vmax + 0.01 * vmin @ rng.standard_normal(n - 1)
     climber._climb_mode = vmax
 
     def climb(a):
@@ -173,19 +173,27 @@ def test_pfro_uses_one_scaling_for_climb_and_descent():
     def descend(a):
         return climber._get_scaled_descend_step(B_opt, g, vmin, a)
 
+    g = 3.0 * vmax + 0.3 * vmin @ rng.standard_normal(n - 1)
     assert climber._get_maxstep(climb(climber.a_max)) > climber.maxstep
     assert climber._get_maxstep(descend(climber.a_max)) < climber.maxstep
-    a = climber._get_pfro_scaling(lambda s: climb(s) + descend(s),
-                                  climber.maxstep)
-    assert a < climber.a_max
+    a_climb = climber._get_pfro_scaling(climb, climber.maxstep)
+    assert a_climb < climber.a_max
+    assert_allclose(climber._get_maxstep(climb(a_climb)), climber.maxstep,
+                    rtol=1e-2)
+    plain = climb(a_climb) + descend(climber.a_max)
 
     step = climber._get_pfro_step(B_opt, g)
-    assert_allclose(climber._get_maxstep(step), climber.maxstep, rtol=1e-2)
+    longest = max(climber._get_maxstep(plain), climber.maxstep)
+    assert_allclose(step, plain * climber.maxstep / longest,
+                    rtol=1e-2, atol=1e-3)
     assert climber._get_maxstep(step) <= climber.maxstep + 1e-9
-    assert_allclose(step, climb(a) + descend(a), rtol=1e-2, atol=1e-3)
-    across = step - np.dot(step, vmax) * vmax
-    assert climber._get_maxstep(across) < climber._get_maxstep(
-        descend(climber.a_max))
+
+    g = 0.01 * vmax + 0.001 * vmin @ rng.standard_normal(n - 1)
+    assert climber._get_maxstep(climb(climber.a_max)) < climber.maxstep
+    step = climber._get_pfro_step(B_opt, g)
+    assert climber._get_maxstep(step) < climber.maxstep
+    assert_allclose(step, climb(climber.a_max) + descend(climber.a_max),
+                    rtol=1e-2, atol=1e-6)
 
 
 def test_pfro_step_nulls_ascent_when_not_climbing():
