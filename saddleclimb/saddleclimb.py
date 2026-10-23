@@ -27,9 +27,9 @@ class SaddleClimb:
             interp: str = 'qst',
 
             hessian_scale: float = 50,
-            min_directed_steps: int = 6,
-            persistence: int = 2,
-            maxstep: float = 0.2,
+            min_directed_steps: int = 10,
+            persistence: int = 3,
+            maxstep: float = 0.15,
 
             min_travel: float = 0.1,
             a_max: float = 1,
@@ -203,24 +203,31 @@ class SaddleClimb:
 
     def _update_streak(self, eigs, vecs):
         """
-        Count consecutive steps with a persistent lowest mode.
+        Count consecutive steps that follow one persistent negative mode.
 
-        A step extends the streak when the lowest eigenvalue of B is
-        negative and the last step's lowest mode, dotted with each
-        current eigenvector, overlaps most with this step's lowest
-        mode (absolute dot products, so eigenvector signs do not
-        matter).  A step with a negative lowest eigenvalue that does
-        not follow on from the last starts a new streak of one, and a
-        step with none resets it to zero.  Other negative eigenvalues
-        are ignored.
+        The mode followed is the eigenvector of B with the largest
+        overlap (absolute dot product, so signs do not matter) with the
+        mode followed last step.  If its eigenvalue is negative the
+        streak grows, and that eigenvector is the one to climb.  If it is
+        not, the streak is reset to zero; the lowest mode then starts a
+        new streak of one if its eigenvalue is negative, and with no
+        mode to follow (the first step, or after a reset) the lowest
+        mode starts it in the same way.  Returns the mode to climb on a
+        free step, or None if the streak is zero.  Other negative
+        eigenvalues are ignored.
         """
-        if not eigs[0] < 0:
-            self._prev_mode, self._streak = None, 0
-            return
-        follows = (self._prev_mode is not None
-                   and np.argmax(np.abs(vecs.T @ self._prev_mode)) == 0)
-        self._streak = self._streak + 1 if follows else 1
-        self._prev_mode = vecs[:, 0]
+        if self._prev_mode is not None:
+            i = int(np.argmax(np.abs(vecs.T @ self._prev_mode)))
+            if eigs[i] < 0:
+                self._streak += 1
+                self._prev_mode = vecs[:, i]
+                return self._prev_mode
+        if eigs[0] < 0:
+            self._streak = 1
+            self._prev_mode = vecs[:, 0]
+            return self._prev_mode
+        self._prev_mode, self._streak = None, 0
+        return None
 
     def _get_B_opt(self, B, g, pos_1D):
         """
@@ -232,15 +239,15 @@ class SaddleClimb:
         that mode's true, positive curvature.  The first
         ``min_directed_steps`` steps are always directed.  After that a
         step is free when the last ``persistence`` steps, this one
-        included, each had a negative lowest eigenvalue, and each
-        one's lowest mode overlapped most with the next one's lowest
-        mode (see ``_update_streak``).  B is then used as it
-        is and its lowest mode is climbed.
+        included, each followed a negative mode: the eigenvector with
+        the most overlap with the last step's mode (see
+        ``_update_streak``).  B is then used as it is and that
+        mode is climbed.
         Otherwise the step is directed: the climb direction is the
         chord to the energy maximum ``f*`` on the path (see
         ``_get_climb_direction``), and it is decoupled from the rest of
         B, so it is an exact eigenvector of the returned Hessian.
-        A step, free or directed, whose climb mode (the lowest mode, or
+        A step, free or directed, whose climb mode (the followed mode, or
         the chord to ``f*``), oriented uphill, points away from both
         ends trips the
         guard: ``_climbing`` is cleared and the climb component of that
@@ -251,13 +258,13 @@ class SaddleClimb:
         dxi = self._pos_i_1D - pos_1D
         dxf = self._pos_f_1D - pos_1D
         eigs_B, vecs_B = LA.eigh(B)
-        self._update_streak(eigs_B, vecs_B)
+        followed = self._update_streak(eigs_B, vecs_B)
         free = (self._step_count >= self.min_directed_steps
                 and self._streak >= self.persistence)
         self._path = None
         self._pos_cur = pos_1D
         if free:
-            B_opt, v = B, vecs_B[:, 0]
+            B_opt, v = B, followed
         else:
             self._path = self._get_path_frame(pos_1D)
             B_opt, v = self._get_directed_hessian(
@@ -314,41 +321,48 @@ class SaddleClimb:
         smin = (a / svecs_min[-1, 0]) * svecs_min[0:Ndim-1, 0]
         return mult(vmin, smin)
 
-    def _get_path_energy_max(self, f):
+    def _get_path_energy_max(self, f, G_f):
         """
         Path variable of the energy maximum along the path, or None.
 
-        The energy along the path is modelled by a quartic whose slope
-        is ``k f (1 - f) (f* - f)`` with ``k > 0``: flat at both ends
-        (the minima), and with exactly one stationary point inside, a
-        maximum at ``f*``.  The two parameters ``k, f*`` are fitted to
-        the energy of the final structure and the energy ``E`` of the
-        current one at ``f``, both relative to the initial structure.
-        The gradient is left out on purpose: it is noisy, and its exact
-        value along one direction can mislead.  Returns None if the fit
-        fails or an energy is not known yet.
+        The energy along the path is modelled by a quintic with a
+        minimum at both ends, ``E(0) = E'(0) = 0`` and
+        ``E(1) = E_final - E_initial``, ``E'(1) = 0``.  That leaves four
+        coefficients, fixed exactly by the energy ``E`` of the current
+        structure at ``f`` and the slope there, ``G_f = dE/df`` (the
+        gradient along the path tangent).  The model slope is
+        ``f (1 - f)`` times a quadratic, so there are at most two
+        stationary points inside the path; the one that is a maximum
+        (negative curvature) is returned, the higher if both are.  None
+        if the energies are not known yet, the system is singular (``f``
+        at an end), or the model has no maximum between the ends.
         """
         if None in (self._E_initial, self._E_final, self._E_cur):
             return None
         E = self._E_cur - self._E_initial
         E_P = self._E_final - self._E_initial
-        scale = max(abs(E), abs(E_P), 1e-3)
-
-        def residuals(x):
-            fs, k = x
-            E_model = (k * Polynomial([0, 1, -1])
-                       * Polynomial([fs, -1])).integ()
-            return np.array([E_model(1) - E_P, E_model(f) - E]) / scale
-
+        powers = np.arange(2, 6)
+        A = np.array([
+            np.ones(4), powers,
+            f**powers, powers * f**(powers - 1)])
+        try:
+            c = LA.solve(A, np.array([E_P, 0.0, E, G_f]))
+        except LA.LinAlgError:
+            return None
+        if not np.all(np.isfinite(c)):
+            return None
+        energy = Polynomial(np.concatenate([[0, 0], c]))
+        slope = energy.deriv()
+        curvature = slope.deriv()
+        eps = 1e-6
         best = None
-        for f0 in (0.3, 0.5, 0.7):
-            res = minimize(
-                lambda x: np.sum(residuals(x)**2), [f0, 50 * scale],
-                method='SLSQP', bounds=[(0.01, 0.99), (1e-9, None)],
-                options={'maxiter': 500, 'ftol': 1e-14})
-            if np.isfinite(res.fun) and (best is None or res.fun < best.fun):
-                best = res
-        return None if best is None else float(best.x[0])
+        for r in slope.roots():
+            if abs(r.imag) > 1e-9 or not eps < r.real < 1 - eps:
+                continue
+            r = r.real
+            if curvature(r) < 0 and (best is None or energy(r) > energy(best)):
+                best = r
+        return None if best is None else float(best)
 
     def _get_climb_direction(self, B, g, pos_1D):
         """
@@ -356,8 +370,8 @@ class SaddleClimb:
         current structure to the path structure at ``f*``.
 
         ``f*`` is the energy maximum along the path, fitted from the end
-        energies and the energy here (see ``_get_path_energy_max``); if
-        that fails it is the P-RFO maximum along the path variable at
+        energies and the energy and slope here (see
+        ``_get_path_energy_max``); if that fails it is the P-RFO maximum along the path variable at
         ``a_max``, kept between the end structures.  The path is solved
         once, at ``f*``.  With ``path_climb`` off, or when ``f*`` is
         where the structure already is, the direction is the path
@@ -367,7 +381,7 @@ class SaddleClimb:
         tangent = t / LA.norm(t)
         if not self.path_climb:
             return tangent
-        f_max = self._get_path_energy_max(f)
+        f_max = self._get_path_energy_max(f, t @ g)
         if f_max is None:
             f_max = np.clip(f + self._get_scaled_path_step(
                 t @ B @ t, t @ g, self.a_max), 0, 1)
