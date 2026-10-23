@@ -26,8 +26,8 @@ class SaddleClimb:
             trajfile: str = 'climb.traj',
             interp: str = 'qst',
 
-            hessian_scale: float = 50,
-            min_directed_steps: int = 10,
+            hessian_scale: float = 30,
+            min_directed_steps: int = 8,
             persistence: int = 3,
             maxstep: float = 0.15,
 
@@ -190,44 +190,37 @@ class SaddleClimb:
         B_new = mult(new_basis, mult(B_transformed, new_basis.T))
         return B_new, new_basis[:, 0]
 
-    def _is_climbing(self, v, g, dxi, dxf):
+    def _is_climbing(self, g, dxi, dxf):
         """
-        False when the uphill climb direction points away from both ends.
+        False when the raw gradient ``g`` points away from both ends.
 
-        The climb mode ``v`` has no sign of its own, so it is oriented
-        uphill (positive dot product with the gradient ``g``) first.
+        ``g`` points uphill, so a gradient with negative dot products
+        against the directions to the initial (``dxi``) and the final
+        (``dxf``) structure says that going uphill leads away from
+        both, off the path between them.
         """
-        if np.dot(v, g) < 0:
-            v = -v
-        return not (np.dot(v, dxi) < 0 and np.dot(v, dxf) < 0)
+        return not (np.dot(g, dxi) < 0 and np.dot(g, dxf) < 0)
 
     def _update_streak(self, eigs, vecs):
         """
-        Count consecutive steps that follow one persistent negative mode.
+        Count consecutive steps with a persistent lowest mode.
 
-        The mode followed is the eigenvector of B with the largest
-        overlap (absolute dot product, so signs do not matter) with the
-        mode followed last step.  If its eigenvalue is negative the
-        streak grows, and that eigenvector is the one to climb.  If it is
-        not, the streak is reset to zero; the lowest mode then starts a
-        new streak of one if its eigenvalue is negative, and with no
-        mode to follow (the first step, or after a reset) the lowest
-        mode starts it in the same way.  Returns the mode to climb on a
-        free step, or None if the streak is zero.  Other negative
-        eigenvalues are ignored.
+        A step extends the streak when the lowest eigenvalue of B is
+        negative and the last step's lowest mode, dotted with each
+        current eigenvector, overlaps most with this step's lowest
+        mode (absolute dot products, so eigenvector signs do not
+        matter).  A step with a negative lowest eigenvalue that does
+        not follow on from the last starts a new streak of one, and a
+        step with none resets it to zero.  Other negative eigenvalues
+        are ignored.
         """
-        if self._prev_mode is not None:
-            i = int(np.argmax(np.abs(vecs.T @ self._prev_mode)))
-            if eigs[i] < 0:
-                self._streak += 1
-                self._prev_mode = vecs[:, i]
-                return self._prev_mode
-        if eigs[0] < 0:
-            self._streak = 1
-            self._prev_mode = vecs[:, 0]
-            return self._prev_mode
-        self._prev_mode, self._streak = None, 0
-        return None
+        if not eigs[0] < 0:
+            self._prev_mode, self._streak = None, 0
+            return
+        follows = (self._prev_mode is not None
+                   and np.argmax(np.abs(vecs.T @ self._prev_mode)) == 0)
+        self._streak = self._streak + 1 if follows else 1
+        self._prev_mode = vecs[:, 0]
 
     def _get_B_opt(self, B, g, pos_1D):
         """
@@ -239,37 +232,35 @@ class SaddleClimb:
         that mode's true, positive curvature.  The first
         ``min_directed_steps`` steps are always directed.  After that a
         step is free when the last ``persistence`` steps, this one
-        included, each followed a negative mode: the eigenvector with
-        the most overlap with the last step's mode (see
-        ``_update_streak``).  B is then used as it is and that
-        mode is climbed.
+        included, each had a negative lowest eigenvalue, and each
+        one's lowest mode overlapped most with the next one's lowest
+        mode (see ``_update_streak``).  B is then used as it
+        is and its lowest mode is climbed.
         Otherwise the step is directed: the climb direction is the
         chord to the energy maximum ``f*`` on the path (see
         ``_get_climb_direction``), and it is decoupled from the rest of
         B, so it is an exact eigenvector of the returned Hessian.
-        A step, free or directed, whose climb mode (the followed mode, or
-        the chord to ``f*``), oriented uphill, points away from both
-        ends trips the
-        guard: ``_climbing`` is cleared and the climb component of that
-        step is nulled, leaving the descent across the climb mode.  The
+        A step, free or directed, whose raw gradient points away from
+        both ends trips the guard (see ``_is_climbing``): ``_climbing``
+        is cleared and the climb component of that step is nulled, leaving the descent across the climb mode.  The
         guard affects only the step it trips on.  The climb mode is
         stored in ``_climb_mode``.
         """
         dxi = self._pos_i_1D - pos_1D
         dxf = self._pos_f_1D - pos_1D
         eigs_B, vecs_B = LA.eigh(B)
-        followed = self._update_streak(eigs_B, vecs_B)
+        self._update_streak(eigs_B, vecs_B)
         free = (self._step_count >= self.min_directed_steps
                 and self._streak >= self.persistence)
         self._path = None
         self._pos_cur = pos_1D
         if free:
-            B_opt, v = B, followed
+            B_opt, v = B, vecs_B[:, 0]
         else:
             self._path = self._get_path_frame(pos_1D)
             B_opt, v = self._get_directed_hessian(
                 B, self._get_climb_direction(B, g, pos_1D))
-        self._climbing = self._is_climbing(v, g, dxi, dxf)
+        self._climbing = self._is_climbing(g, dxi, dxf)
         self._climb_mode = v
         self._free = free
         return B_opt
