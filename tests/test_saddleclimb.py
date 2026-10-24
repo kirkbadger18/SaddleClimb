@@ -12,10 +12,11 @@ import tempfile
 import copy
 
 
-def allow_free(climber):
-    """Put the climber past ``min_directed_steps``, so a negative lowest
-    eigenvalue makes the step free."""
+def seed_streak(climber, B):
+    """Put the climber one step short of a free climb on B's negative mode."""
     climber._step_count = climber.min_directed_steps
+    climber._prev_mode = LA.eigh(B)[1][:, 0]
+    climber._streak = climber.persistence - 1
 
 
 def generate_saddleclimb_object(interp='linear'):
@@ -267,7 +268,7 @@ def test_tripped_guard_nulls_the_climb_step_free_or_directed():
         eigs[0], eigs[1] = (5.0 if directed else -5.0), 1.0
         B = basis @ np.diag(eigs) @ basis.T
         if not directed:
-            allow_free(climber)
+            seed_streak(climber, B)
         B_opt = climber._get_B_opt(B, g, far)
         step = climber._get_step(B_opt, g)
         v = climber._climb_mode
@@ -362,7 +363,7 @@ def test_tripped_guard_is_a_one_off():
     eigs = np.full(n, 10.0)
     eigs[0] = -5.0
     B = basis @ np.diag(eigs) @ basis.T
-    allow_free(climber)
+    seed_streak(climber, B)
 
     # Past the final endpoint, a gradient along +w leads away from both.
     far = climber._pos_i_1D + 1.3 * chord + 0.5 * w
@@ -377,12 +378,18 @@ def test_tripped_guard_is_a_one_off():
     assert climbing == [True, False, True, True]
 
 
-def test_free_whenever_the_lowest_eigenvalue_is_negative():
-    """Past ``min_directed_steps`` a step is free exactly when the lowest
-    eigenvalue of B is negative, whichever mode that is; before it the
-    climb is directed whatever B is."""
+def test_free_needs_a_persistent_lowest_mode():
+    """Free only after ``persistence`` steps with a persistent lowest mode.
+
+    Each of the last ``persistence`` steps needs a negative lowest
+    eigenvalue, and each one's lowest mode must overlap most with the
+    next one's.  Further negative modes are ignored; a different lowest
+    mode or none start the count over, and ``min_directed_steps`` holds
+    the climb directed whatever the streak.
+    """
     climber = generate_saddleclimb_object()
-    climber.min_directed_steps = 5
+    climber.min_directed_steps = 0
+    climber.persistence = 3
     idx = climber.indices
     n = 3 * len(idx)
     climber._pos_i_1D = climber.atoms_initial.positions[idx, :].reshape(-1)
@@ -399,20 +406,40 @@ def test_free_whenever_the_lowest_eigenvalue_is_negative():
         eigs[negative] = value
         return basis @ np.diag(eigs) @ basis.T
 
-    def free(B, step_count=100):
+    def free_after(B, step_count=100):
         climber._step_count = step_count
         climber._get_B_opt(B, g, pos_1D)
-        return bool(climber._free)
+        return bool(climber._free), climber._streak
 
-    assert free(hessian([0]))
-    assert free(hessian([1]))
-    assert_allclose(abs(climber._climb_mode @ basis[:, 1]), 1, atol=1e-10)
-    assert free(hessian([0, 1]))
-    assert not free(hessian([1], 1.0))
+    B = hessian([0])
+    assert free_after(B) == (False, 1)
+    assert free_after(B) == (False, 2)
+    assert free_after(B) == (True, 3)
+    assert free_after(B) == (True, 4)
 
-    # min_directed_steps holds the climb directed.
-    assert not free(hessian([0]), step_count=4)
-    assert free(hessian([0]), step_count=5)
+    # A second, shallower negative mode is ignored: the count goes on.
+    B2 = hessian([0, 1])
+    B2 = B2 + 4.0 * np.outer(basis[:, 1], basis[:, 1])
+    assert free_after(B2) == (True, 5)
+
+    # A different lowest mode follows on from nothing.
+    assert free_after(hessian([1])) == (False, 1)
+    assert free_after(hessian([1])) == (False, 2)
+    assert free_after(hessian([1])) == (True, 3)
+
+    # No negative mode at all.
+    assert free_after(hessian([1], 1.0)) == (False, 0)
+
+    # min_directed_steps holds the climb directed while the streak builds.
+    climber.min_directed_steps = 5
+    assert free_after(B, step_count=0) == (False, 1)
+    assert free_after(B, step_count=0) == (False, 2)
+    assert free_after(B, step_count=0) == (False, 3)
+    assert free_after(B, step_count=climber.min_directed_steps) == (True, 4)
+
+    with pytest.raises(ValueError):
+        SaddleClimb(climber.atoms_initial, climber.atoms_final, EMT(),
+                    persistence=0)
 
 
 def directed_setup(interp, scale=0.2):
@@ -563,3 +590,39 @@ def test_shrinking_alpha_keeps_the_climb_direction(interp):
         assert_allclose(abs(c @ climbs[0]) / (LA.norm(c) * LA.norm(climbs[0])),
                         1, atol=1e-9)
     assert LA.norm(climbs[2]) < LA.norm(climbs[1]) < LA.norm(climbs[0])
+
+
+def test_endpoint_wrapped_across_the_cell_moves_the_short_way():
+    """An atom held on the far side of the cell in the final structure is
+    unwrapped onto its nearest image, so the chord, the first step and
+    the product distances all take the short, minimum-image way."""
+    init = fcc111('Pt', size=(3, 3, 4), vacuum=10.0)
+    add_adsorbate(init, 'H', 1.5, 'fcc')
+    final = init.copy()
+    h = len(init) - 1
+    hop = np.array([0.3, 0.2, 0.0])
+    final.positions[h] += hop + init.cell[1]
+    climber = SaddleClimb(init, final, EMT())
+
+    assert climber.indices == [h]
+    assert_allclose(climber.atoms_final.positions[h],
+                    init.positions[h] + hop, atol=1e-10)
+    assert_allclose(climber._r_P,
+                    final.get_all_distances(mic=True), atol=1e-10)
+
+    idx = climber.indices
+    dx, _ = climber._get_initial_step(idx)
+    assert dx[0] @ hop > 0
+    assert LA.norm(dx[0]) <= LA.norm(hop) + 1e-10
+
+
+def test_pair_distances_are_minimum_image_per_structure():
+    """Each structure's pair distances use its own minimum image, not the
+    images of the initial structure."""
+    climber = generate_saddleclimb_object()
+    pos = climber.atoms_initial.positions.copy()
+    pos[-1] += climber.atoms_initial.cell[0] * 0.6
+    moved = climber.atoms_initial.copy()
+    moved.positions = pos
+    assert_allclose(climber._pair_distances(pos),
+                    moved.get_all_distances(mic=True), atol=1e-10)

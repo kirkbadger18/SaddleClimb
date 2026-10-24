@@ -27,7 +27,8 @@ class SaddleClimb:
             interp: str = 'qst',
 
             hessian_scale: float = 20,
-            min_directed_steps: int = 5,
+            min_directed_steps: int = 8,
+            persistence: int = 3,
             maxstep: float = 0.15,
 
             min_travel: float = 0.1,
@@ -38,7 +39,7 @@ class SaddleClimb:
             ) -> None:
 
         self.atoms_initial = atoms_initial
-        self.atoms_final = atoms_final
+        self.atoms_final = self._unwrap(atoms_final, atoms_initial)
         self.target_indices = target_indices
         self.calculator = calculator
         assert interp in ('linear', 'qst')
@@ -53,6 +54,10 @@ class SaddleClimb:
             raise ValueError('min_directed_steps must not be negative, '
                              f'got {min_directed_steps}')
         self.min_directed_steps = min_directed_steps
+        if not persistence >= 1:
+            raise ValueError('persistence must be at least 1, '
+                             f'got {persistence}')
+        self.persistence = persistence
         self.a_max = a_max
         self.max_scaling_halvings = max_scaling_halvings
         self.logfile = logfile
@@ -62,6 +67,8 @@ class SaddleClimb:
         self._climbing = True
         self._path = None
         self._step_count = 0
+        self._prev_mode = None
+        self._streak = 0
         self._E_initial = None
         self._E_final = None
         self._E_cur = None
@@ -75,25 +82,42 @@ class SaddleClimb:
                             if self.target_indices else list(self.indices))
         self.hessian = (hessian_scale
                         * np.eye(3*len(self.indices)))
-        self._mic_offset = self._get_mic_offset()
+        self._r_R = self._pair_distances(self.atoms_initial.positions)
+        self._r_P = self._pair_distances(self.atoms_final.positions)
 
-    def _get_mic_offset(self):
-        """Lattice shift making every pair minimum-image.
-
-        Resolved once from the initial structure.  A pair only changes
-        image near the half-cell surface, far outside bonding range, so
-        the choice holds for the whole climb.
+    @staticmethod
+    def _unwrap(atoms, reference):
         """
-        pos = self.atoms_initial.positions
-        raw = pos[:, None, :] - pos[None, :, :]
+        Copy of ``atoms`` with every atom moved to its periodic image
+        nearest the same atom in ``reference``.
+
+        Endpoints optimised separately can hold an atom on opposite
+        sides of the cell.  Unwrapped, each atom's displacement between
+        the endpoints is its minimum-image one, so the chord, the path
+        coordinate and every step point the short way round and no atom
+        jumps across the cell.
+        """
+        out = atoms.copy()
+        d, _ = find_mic(atoms.positions - reference.positions,
+                        reference.cell, reference.pbc)
+        out.positions = reference.positions + d
+        return out
+
+    def _get_mic_offset(self, positions):
+        """Lattice shift making every pair of ``positions`` minimum-image."""
+        raw = positions[:, None, :] - positions[None, :, :]
         mic, _ = find_mic(raw.reshape(-1, 3), self.atoms_initial.cell,
                           self.atoms_initial.pbc)
         return mic.reshape(raw.shape) - raw
 
-    def _pair_vectors(self, positions):
-        """Minimum-image vector between every pair of atoms."""
-        return (positions[:, None, :] - positions[None, :, :]
-                + self._mic_offset)
+    def _pair_vectors(self, positions, offset=None):
+        """
+        Vector between every pair of atoms: the minimum-image one of this
+        structure, or the image given by a fixed lattice ``offset``.
+        """
+        if offset is None:
+            offset = self._get_mic_offset(positions)
+        return positions[:, None, :] - positions[None, :, :] + offset
 
     def _pair_distances(self, positions):
         """Minimum-image distance between every pair of atoms."""
@@ -194,6 +218,27 @@ class SaddleClimb:
         """
         return not (np.dot(g, dxi) < 0 and np.dot(g, dxf) < 0)
 
+    def _update_streak(self, eigs, vecs):
+        """
+        Count consecutive steps with a persistent lowest mode.
+
+        A step extends the streak when the lowest eigenvalue of B is
+        negative and the last step's lowest mode, dotted with each
+        current eigenvector, overlaps most with this step's lowest
+        mode (absolute dot products, so eigenvector signs do not
+        matter).  A step with a negative lowest eigenvalue that does
+        not follow on from the last starts a new streak of one, and a
+        step with none resets it to zero.  Other negative eigenvalues
+        are ignored.
+        """
+        if not eigs[0] < 0:
+            self._prev_mode, self._streak = None, 0
+            return
+        follows = (self._prev_mode is not None
+                   and np.argmax(np.abs(vecs.T @ self._prev_mode)) == 0)
+        self._streak = self._streak + 1 if follows else 1
+        self._prev_mode = vecs[:, 0]
+
     def _get_B_opt(self, B, g, pos_1D):
         """
         Hessian handed to P-RFO, and the mode it climbs.
@@ -203,8 +248,11 @@ class SaddleClimb:
         lowest across it, and it climbs a convex mode only if it sees
         that mode's true, positive curvature.  The first
         ``min_directed_steps`` steps are always directed.  After that a
-        step is free whenever the lowest eigenvalue of B is negative.
-        B is then used as it is and its lowest mode is climbed.
+        step is free when the last ``persistence`` steps, this one
+        included, each had a negative lowest eigenvalue, and each
+        one's lowest mode overlapped most with the next one's lowest
+        mode (see ``_update_streak``).  B is then used as it
+        is and its lowest mode is climbed.
         Otherwise the step is directed: the climb direction is the
         chord to the energy maximum ``f*`` on the path (see
         ``_get_climb_direction``), and it is decoupled from the rest of
@@ -219,8 +267,9 @@ class SaddleClimb:
         dxi = self._pos_i_1D - pos_1D
         dxf = self._pos_f_1D - pos_1D
         eigs_B, vecs_B = LA.eigh(B)
+        self._update_streak(eigs_B, vecs_B)
         free = (self._step_count >= self.min_directed_steps
-                and eigs_B[0] < 0)
+                and self._streak >= self.persistence)
         self._path = None
         self._pos_cur = pos_1D
         if free:
@@ -331,8 +380,9 @@ class SaddleClimb:
 
         ``f*`` is the energy maximum along the path, fitted from the end
         energies and the energy and slope here (see
-        ``_get_path_energy_max``); if that fails it is the P-RFO maximum along the path variable at
-        ``a_max``, kept between the end structures.  The path is solved
+        ``_get_path_energy_max``); if that fails it is the P-RFO maximum
+        along the path variable at ``a_max``, kept between the end
+        structures.  The path is solved
         once, at ``f*``.  With ``path_climb`` off, or when ``f*`` is
         where the structure already is, the direction is the path
         tangent.
@@ -617,6 +667,10 @@ class SaddleClimb:
                 self._E_initial = first.get_potential_energy()
                 self._E_final = self._get_final_energy()
             self._E_cur = E
+            prev = self._restart_trajectory.info.get('saddleclimb_prev_mode')
+            self._prev_mode = None if prev is None else np.array(prev)
+            self._streak = self._restart_trajectory.info.get(
+                'saddleclimb_streak', 0)
             B_opt = self._get_B_opt(B, g, pos_1D)
             dx_1D = self._get_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
@@ -640,6 +694,7 @@ class SaddleClimb:
             B = self._update_hessian(B, dg, dx_1D)
             self._step_count = n
             self._E_cur = E
+            prev_mode, streak = self._prev_mode, self._streak
             B_opt = self._get_B_opt(B, g, pos_1D)
             dx_1D = self._get_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
@@ -651,6 +706,11 @@ class SaddleClimb:
             atoms.info['saddleclimb_iterations'] = n + 0
             atoms.info['saddleclimb_E_initial'] = float(self._E_initial)
             atoms.info['saddleclimb_E_final'] = float(self._E_final)
+            atoms.info['saddleclimb_streak'] = int(streak)
+            if prev_mode is None:
+                atoms.info.pop('saddleclimb_prev_mode', None)
+            else:
+                atoms.info['saddleclimb_prev_mode'] = prev_mode.tolist()
             image = atoms.copy()
             image.calc = SinglePointCalculator(image, energy=E, forces=f)
             traj.write(image)
@@ -712,11 +772,8 @@ class SaddleClimb:
         structure sets the quadratic term, and `f` is the interpolation
         parameter at which the distances are evaluated.
         """
-        pos_R = self.atoms_initial.positions
-        pos_P = self.atoms_final.positions
         p_m = self._get_path_coordinate(positions)
-        r_R = self._pair_distances(pos_R)
-        r_P = self._pair_distances(pos_P)
+        r_R, r_P = self._r_R, self._r_P
         r_M = self._pair_distances(positions)
         denom = p_m * (1 - p_m)
         if denom == 0:
@@ -751,15 +808,16 @@ class SaddleClimb:
                 else np.asarray(indices))
         iu = np.triu_indices(len(positions_guess), k=1)
         r_i = r_interp[iu]
-        r_R = self._pair_distances(self.atoms_initial.positions)[iu]
-        r_P = self._pair_distances(self.atoms_final.positions)[iu]
+        r_R, r_P = self._r_R[iu], self._r_P[iu]
         w = 1 / r_i**4 + 1 / r_R**4 + 1 / r_P**4
         x0 = positions_guess[free].reshape(-1)
+        # Images fixed from the guess, so S stays smooth during the fit.
+        offset = self._get_mic_offset(positions_guess)
 
         def S_and_grad(x):
             pos = positions_guess.copy()
             pos[free] = x.reshape(-1, 3)
-            dpos = self._pair_vectors(pos)
+            dpos = self._pair_vectors(pos, offset)
             r_c = np.sqrt((dpos**2).sum(-1))
             dr = r_c[iu] - r_i
             dx = x - x0
