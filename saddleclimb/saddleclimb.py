@@ -1,5 +1,3 @@
-import sys
-import os
 import numpy as np
 import numpy.linalg as LA
 from numpy import matmul as mult
@@ -10,13 +8,14 @@ from ase.io.trajectory import Trajectory
 from numpy.polynomial import Polynomial
 from scipy.optimize import brentq, minimize
 from ase.geometry import find_mic
+from ase.neighborlist import primitive_neighbor_list
 from pathlib import Path
 
 
 class SaddleClimb:
 
     def __init__(
-            self: None,
+            self,
             atoms_initial: Atoms,
             atoms_final: Atoms,
             calculator: Calculator,
@@ -26,15 +25,16 @@ class SaddleClimb:
             trajfile: str = 'climb.traj',
             interp: str = 'qst',
 
-            hessian_scale: float = 30,
-            min_directed_steps: int = 6,
+            hessian_scale: float = 25,
+            min_directed_steps: int = 10,
             persistence: int = 3,
-            maxstep: float = 0.15,
+            maxstep: float = 0.1,
 
             min_travel: float = 0.1,
             a_max: float = 1,
             max_scaling_halvings: int = 60,
             delta_f: float = 0.01,
+            r_cut: float = 6.0,
             path_climb: bool = True,
             ) -> None:
 
@@ -45,11 +45,12 @@ class SaddleClimb:
         assert interp in ('linear', 'qst')
         self.interp = interp
         self.delta_f = delta_f
+        # Molecules keep every pair at full weight, as in eq. (2).
+        self.r_cut = r_cut if self.atoms_initial.pbc.any() else np.inf
         self.path_climb = path_climb
         self.fmax = fmax
         self.maxstep = maxstep
         self.min_travel = min_travel
-        self.hessian_scale = hessian_scale
         if not min_directed_steps >= 0:
             raise ValueError('min_directed_steps must not be negative, '
                              f'got {min_directed_steps}')
@@ -65,37 +66,35 @@ class SaddleClimb:
         self._restart = False
         self._free = False
         self._climbing = True
-        self._path = None
         self._step_count = 0
         self._prev_mode = None
         self._streak = 0
         self._E_initial = None
         self._E_final = None
         self._E_cur = None
-        self._get_moving_atoms()
+        dpos = self.atoms_final.positions - self.atoms_initial.positions
+        self.indices = [i for i in range(len(dpos))
+                        if LA.norm(dpos[i]) > 1e-6]
         if self.target_indices:
-            self._get_sub_target_atoms()
+            self.sub_target_indices = [
+                i for i, atom in enumerate(self.indices)
+                if atom in self.target_indices]
             if not self.sub_target_indices:
                 raise ValueError('no atom in target_indices moves '
                                  'between the initial and final states')
         self._bias_atoms = ([self.indices[i] for i in self.sub_target_indices]
                             if self.target_indices else list(self.indices))
-        self.hessian = (hessian_scale
-                        * np.eye(3*len(self.indices)))
-        self._r_R = self._pair_distances(self.atoms_initial.positions)
-        self._r_P = self._pair_distances(self.atoms_final.positions)
+        self._pos_i_1D = self.atoms_initial.positions[self.indices].reshape(-1)
+        self._pos_f_1D = self.atoms_final.positions[self.indices].reshape(-1)
+        self.hessian = hessian_scale * np.eye(3*len(self.indices))
 
     @staticmethod
     def _unwrap(atoms, reference):
         """
-        Copy of ``atoms`` with every atom moved to its periodic image
-        nearest the same atom in ``reference``.
-
-        Endpoints optimised separately can hold an atom on opposite
-        sides of the cell.  Unwrapped, each atom's displacement between
-        the endpoints is its minimum-image one, so the chord, the path
-        coordinate and every step point the short way round and no atom
-        jumps across the cell.
+        Copy of ``atoms`` with each atom on its image nearest ``reference``.
+        This puts every structure in the reactant's continuous frame, where
+        displacements are plain differences: the QST image pairs need that,
+        and a minimum-image one can point to another image of an end.
         """
         out = atoms.copy()
         d, _ = find_mic(atoms.positions - reference.positions,
@@ -103,49 +102,38 @@ class SaddleClimb:
         out.positions = reference.positions + d
         return out
 
-    def _mic(self, d):
+    def _get_image_pairs(self, positions):
         """
-        Minimum-image form of displacements ``d`` between two structures,
-        flat or shaped (n, 3), returned in the same shape.
+        Pairs ``(a, b, T)``: atom a and b's image shifted by lattice vector
+        T, within ``r_cut`` in R, P or ``positions`` (Govind et al., Comput.
+        Mater. Sci. 28 (2003) 250, eq. 5).  T stays fixed along the path, so
+        an atom can see two images of a neighbour.  Pair vector x_b - x_a + T.
         """
-        mic, _ = find_mic(np.reshape(d, (-1, 3)), self.atoms_initial.cell,
-                          self.atoms_initial.pbc)
-        return mic.reshape(np.shape(d))
+        if not self.atoms_initial.pbc.any():
+            a, b = np.triu_indices(len(positions), k=1)
+            return a, b, np.zeros((len(a), 3))
+        cell = np.asarray(self.atoms_initial.cell)
+        found = []
+        for pos in (self.atoms_initial.positions,
+                    self.atoms_final.positions, positions):
+            i, j, S = primitive_neighbor_list(
+                'ijS', self.atoms_initial.pbc, cell, pos, self.r_cut)
+            # (b, a, -T) is the same pair, and a == b is a fixed length.
+            keep = i < j
+            found.append(np.column_stack([i[keep], j[keep], S[keep]]))
+        ijS = np.unique(np.concatenate(found), axis=0)
+        return ijS[:, 0], ijS[:, 1], ijS[:, 2:] @ cell
 
-    def _get_mic_offset(self, positions):
-        """Lattice shift making every pair of ``positions`` minimum-image."""
-        raw = positions[:, None, :] - positions[None, :, :]
-        mic, _ = find_mic(raw.reshape(-1, 3), self.atoms_initial.cell,
-                          self.atoms_initial.pbc)
-        return mic.reshape(raw.shape) - raw
+    @staticmethod
+    def _image_distances(positions, pairs):
+        """Distance of each image pair ``(a, b, T)`` in ``positions``."""
+        a, b, T = pairs
+        return LA.norm(positions[b] - positions[a] + T, axis=1)
 
-    def _pair_vectors(self, positions, offset=None):
-        """
-        Vector between every pair of atoms: the minimum-image one of this
-        structure, or the image given by a fixed lattice ``offset``.
-        """
-        if offset is None:
-            offset = self._get_mic_offset(positions)
-        return positions[:, None, :] - positions[None, :, :] + offset
-
-    def _pair_distances(self, positions):
-        """Minimum-image distance between every pair of atoms."""
-        return LA.norm(self._pair_vectors(positions), axis=-1)
-
-    def _get_moving_atoms(self):
-        dpos = self.atoms_final.positions - self.atoms_initial.positions
-        idx = []
-        for i in range(dpos.shape[0]):
-            if LA.norm(dpos[i, :]) > 1e-6:
-                idx.append(i)
-        self.indices = idx.copy()
-
-    def _get_sub_target_atoms(self):
-        sub_indices = []
-        for i in range(len(self.indices)):
-            if self.indices[i] in self.target_indices:
-                sub_indices.append(i)
-        self.sub_target_indices = sub_indices.copy()
+    def _cut_weight(self, r):
+        """1/r^4 - 1/r_cut^4 inside ``r_cut``, 0 beyond (eq. 5)."""
+        with np.errstate(divide='ignore'):
+            return np.where(r < self.r_cut, 1 / r**4 - 1 / self.r_cut**4, 0)
 
     def _hold_non_targets(self, v_1D):
         """Zero the components of atoms outside ``target_indices``."""
@@ -155,30 +143,17 @@ class SaddleClimb:
                     v_1D[3*i:3*i+3] = 0
         return v_1D
 
-    def _get_bias_vector(self, pos_1D):
-        """Bias direction with atoms outside ``target_indices`` held."""
-        return self._hold_non_targets(self._get_bias_direction(pos_1D))
-
     def _get_path_frame(self, pos_1D):
         """
-        Path variable f of the current structure, the tangent there, and
-        the path itself.
-
-        Returns ``f``, the tangent ``t = dx/df`` over the moving atoms
-        (atoms outside ``target_indices`` held), the moving-atom
-        positions already known on the path as a dict ``{f: x}``, and a
-        function that solves for the positions at any other ``f``.  A
-        linear path is a straight line along the chord through the
-        current structure; a QST path is the quadratic path through it
-        (see ``_get_qst_positions``).  The two QST structures that
-        give the tangent are kept, so they cost nothing again.
+        Path variable f here, tangent t = dx/df (non-targets held), and a
+        function giving the moving-atom positions at any f.  The linear path
+        is the chord through the current structure; the QST path is the
+        quadratic one through it (see ``_get_qst_positions``).
         """
         if self.interp == 'linear':
-            chord = self._hold_non_targets(
-                self._mic(self._pos_f_1D - self._pos_i_1D))
-            f = self._mic(pos_1D - self._pos_i_1D) @ chord / (chord @ chord)
-            return (f, chord, {f: pos_1D, f + 1: pos_1D + chord},
-                    lambda f_star: pos_1D + (f_star - f) * chord)
+            chord = self._hold_non_targets(self._pos_f_1D - self._pos_i_1D)
+            f = (pos_1D - self._pos_i_1D) @ chord / (chord @ chord)
+            return f, chord, lambda f_star: pos_1D + (f_star - f) * chord
         pos = self.atoms_initial.positions.copy()
         pos[self.indices, :] = pos_1D.reshape(-1, 3)
         p_m = self._get_path_coordinate(pos)
@@ -186,8 +161,7 @@ class SaddleClimb:
         f_plus = min(p_m + self.delta_f, 1)
         x_minus = self._get_qst_positions(pos, f_minus)
         x_plus = self._get_qst_positions(pos, f_plus)
-        t = (self._hold_non_targets(self._mic(x_plus - x_minus))
-             / (f_plus - f_minus))
+        t = self._hold_non_targets(x_plus - x_minus) / (f_plus - f_minus)
         bias_rows = [self.indices.index(i) for i in self._bias_atoms]
 
         def path_at(f_star):
@@ -198,20 +172,15 @@ class SaddleClimb:
                                         * t.reshape(-1, 3)[bias_rows])
             return self._get_qst_positions(pos, f_star, guess)
 
-        return (p_m, t, {f_minus: x_minus, p_m: pos_1D, f_plus: x_plus},
-                path_at)
+        return p_m, t, path_at
 
     def _get_directed_hessian(self, B, bias):
         """
-        B with the bias direction decoupled from the rest.
-
-        The cross terms between the bias and every other direction are
-        nulled; no curvature is changed, so the bias keeps its own
-        curvature u^T B u whatever its sign.  Returns the decoupled
-        Hessian and the unit bias u, an exact eigenvector of it.
+        B with the bias direction's cross terms nulled, so the unit bias u
+        is an exact eigenvector keeping its curvature u^T B u whatever its
+        sign.  Returns the new Hessian and u.
         """
-        first_column = bias
-        new_basis, _ = LA.qr(first_column.reshape(-1, 1), mode='complete')
+        new_basis, _ = LA.qr(bias.reshape(-1, 1), mode='complete')
         B_transformed = mult(new_basis.T, mult(B, new_basis))
         B_transformed[1:, 0], B_transformed[0, 1:] = 0, 0
         B_new = mult(new_basis, mult(B_transformed, new_basis.T))
@@ -219,12 +188,8 @@ class SaddleClimb:
 
     def _is_climbing(self, v, g, dxi, dxf):
         """
-        False when the uphill climb direction points away from both ends.
-
-        The climb mode ``v`` has no sign of its own, so it is oriented
-        uphill (positive dot product with the gradient ``g``) first,
-        then dotted with the directions to the initial (``dxi``) and
-        the final (``dxf``) structure.
+        False when the climb mode ``v``, oriented uphill along ``g``, points
+        away from both the initial (``dxi``) and final (``dxf``) structure.
         """
         if np.dot(v, g) < 0:
             v = -v
@@ -232,16 +197,10 @@ class SaddleClimb:
 
     def _update_streak(self, eigs, vecs):
         """
-        Count consecutive steps with a persistent lowest mode.
-
-        A step extends the streak when the lowest eigenvalue of B is
-        negative and the last step's lowest mode, dotted with each
-        current eigenvector, overlaps most with this step's lowest
-        mode (absolute dot products, so eigenvector signs do not
-        matter).  A step with a negative lowest eigenvalue that does
-        not follow on from the last starts a new streak of one, and a
-        step with none resets it to zero.  Other negative eigenvalues
-        are ignored.
+        Count consecutive steps with a persistent negative lowest mode: it
+        follows on when the last lowest mode overlaps most with this one
+        (absolute overlaps).  Otherwise the streak restarts at one, or at
+        zero without a negative lowest eigenvalue.
         """
         if not eigs[0] < 0:
             self._prev_mode, self._streak = None, 0
@@ -253,42 +212,20 @@ class SaddleClimb:
 
     def _get_B_opt(self, B, g, pos_1D):
         """
-        Hessian handed to P-RFO, and the mode it climbs.
-
-        No eigenvalue signs are changed: P-RFO imposes the saddle shape
-        itself by taking the highest root along the climb mode and the
-        lowest across it, and it climbs a convex mode only if it sees
-        that mode's true, positive curvature.  The first
-        ``min_directed_steps`` steps are always directed.  After that a
-        step is free when the last ``persistence`` steps, this one
-        included, each had a negative lowest eigenvalue, and each
-        one's lowest mode overlapped most with the next one's lowest
-        mode (see ``_update_streak``).  B is then used as it
-        is and its lowest mode is climbed.
-        Otherwise the step is directed: the climb direction is the
-        chord to the energy maximum ``f*`` on the path (see
-        ``_get_climb_direction``), and it is decoupled from the rest of
-        B, so it is an exact eigenvector of the returned Hessian.
-        A step, free or directed, whose climb mode (the lowest mode, or
-        the chord to ``f*``), oriented uphill, points away from both
-        ends trips the guard (see ``_is_climbing``): ``_climbing``
-        is cleared and the climb component of that step is nulled,
-        leaving the descent across the climb mode.  The guard affects
-        only the step it trips on.  The climb mode is stored in
-        ``_climb_mode``.
+        Hessian for P-RFO; sets ``_climb_mode``, ``_free``, ``_climbing``.
+        Free (B as is, lowest mode) once past ``min_directed_steps`` with a
+        ``persistence``-long streak; else directed along the chord to f*.
+        A climb mode leading away from both ends trips the guard.
         """
-        dxi = self._mic(self._pos_i_1D - pos_1D)
-        dxf = self._mic(self._pos_f_1D - pos_1D)
+        dxi = self._pos_i_1D - pos_1D
+        dxf = self._pos_f_1D - pos_1D
         eigs_B, vecs_B = LA.eigh(B)
         self._update_streak(eigs_B, vecs_B)
         free = (self._step_count >= self.min_directed_steps
                 and self._streak >= self.persistence)
-        self._path = None
-        self._pos_cur = pos_1D
         if free:
             B_opt, v = B, vecs_B[:, 0]
         else:
-            self._path = self._get_path_frame(pos_1D)
             B_opt, v = self._get_directed_hessian(
                 B, self._get_climb_direction(B, g, pos_1D))
         self._climbing = self._is_climbing(v, g, dxi, dxf)
@@ -297,23 +234,13 @@ class SaddleClimb:
         return B_opt
 
     def _get_maxstep(self, dx_1D: np.ndarray) -> float:
-        """Displacement of the furthest-moving atom.
-
-        The one distance convention used throughout: every step
-        length, floor and travel threshold means "how far the
-        atom that moves most moves".  Independent of system size,
-        and the same reduction ``Fmax`` uses for forces.
-        """
+        """Length of the largest per-atom vector: steps, travel and Fmax."""
         return LA.norm(dx_1D.reshape(-1, 3), axis=1).max()
 
     def _get_scaled_climb_step(self, B_opt, g, vmax, a):
         """
-        Climb component of the P-RFO step, maximised along ``vmax``.
-
-        When the guard has cleared ``_climbing`` this component is
-        nulled rather than descended: climb and descent would otherwise
-        be the same mode pulling opposite ways, and what is left
-        relaxes everything perpendicular to it.
+        Climb component of the P-RFO step, maximised along ``vmax``; nulled
+        when the guard has cleared ``_climbing``, leaving the descent.
         """
         if not self._climbing:
             return np.zeros_like(g)
@@ -325,10 +252,7 @@ class SaddleClimb:
         return (a*svecs_max[0, 1] / svecs_max[1, 1]) * vmax
 
     def _get_scaled_path_step(self, H_f, G_f, a):
-        """
-        P-RFO maximum along the path variable: the change in ``f``, from
-        the gradient ``G_f = dE/df`` and curvature ``H_f = d2E/df2``.
-        """
+        """P-RFO maximum along f, from dE/df ``G_f`` and d2E/df2 ``H_f``."""
         _, svecs = LA.eigh(np.array([[a**2*H_f, a*G_f], [a*G_f, 0.0]]))
         return a*svecs[0, 1] / svecs[1, 1]
 
@@ -345,19 +269,10 @@ class SaddleClimb:
 
     def _get_path_energy_max(self, f, G_f):
         """
-        Path variable of the energy maximum along the path, or None.
-
-        The energy along the path is modelled by a quintic with a
-        minimum at both ends, ``E(0) = E'(0) = 0`` and
-        ``E(1) = E_final - E_initial``, ``E'(1) = 0``.  That leaves four
-        coefficients, fixed exactly by the energy ``E`` of the current
-        structure at ``f`` and the slope there, ``G_f = dE/df`` (the
-        gradient along the path tangent).  The model slope is
-        ``f (1 - f)`` times a quadratic, so there are at most two
-        stationary points inside the path; the one that is a maximum
-        (negative curvature) is returned, the higher if both are.  None
-        if the energies are not known yet, the system is singular (``f``
-        at an end), or the model has no maximum between the ends.
+        f of the energy maximum on a quintic E(f) with minima at both ends,
+        fitted to the end energies and the energy and slope ``G_f`` at f.
+        The higher interior maximum, or None if there is none, the energies
+        are unknown, or the fit is singular.
         """
         if None in (self._E_initial, self._E_final, self._E_cur):
             return None
@@ -388,19 +303,11 @@ class SaddleClimb:
 
     def _get_climb_direction(self, B, g, pos_1D):
         """
-        Unit climb direction of a directed step: the chord from the
-        current structure to the path structure at ``f*``.
-
-        ``f*`` is the energy maximum along the path, fitted from the end
-        energies and the energy and slope here (see
-        ``_get_path_energy_max``); if that fails it is the P-RFO maximum
-        along the path variable at ``a_max``, kept between the end
-        structures.  The path is solved
-        once, at ``f*``.  With ``path_climb`` off, or when ``f*`` is
-        where the structure already is, the direction is the path
-        tangent.
+        Unit chord to the path structure at f*: the fitted energy maximum,
+        else the P-RFO maximum along f at ``a_max``, kept in [0, 1].  The
+        tangent with ``path_climb`` off or when f* is where we already are.
         """
-        f, t, _, path_at = self._path
+        f, t, path_at = self._get_path_frame(pos_1D)
         tangent = t / LA.norm(t)
         if not self.path_climb:
             return tangent
@@ -408,42 +315,15 @@ class SaddleClimb:
         if f_max is None:
             f_max = np.clip(f + self._get_scaled_path_step(
                 t @ B @ t, t @ g, self.a_max), 0, 1)
-        dx = self._hold_non_targets(self._mic(path_at(f_max) - pos_1D))
+        dx = self._hold_non_targets(path_at(f_max) - pos_1D)
         norm = LA.norm(dx)
         return tangent if norm == 0 else dx / norm
 
-    def _get_path_climb(self, B_opt, g):
-        """
-        Climb step for an explicit scaling, solved in path space.
-
-        The gradient and Hessian are projected onto the path tangent and
-        the P-RFO maximum at the scaling gives ``f*``, kept between the
-        end structures.  The climb is the path structure at ``f*``
-        minus the current one, so it bends with the path.  The searched
-        step does not use this: it climbs along the fixed direction from
-        ``_get_climb_direction``.
-        """
-        f, t, _, path_at = self._path
-        G_f, H_f = t @ g, t @ B_opt @ t
-        x0 = self._pos_cur
-        return lambda scale: self._mic(path_at(np.clip(
-            f + self._get_scaled_path_step(H_f, G_f, scale), 0, 1)) - x0)
-
     def _get_pfro_scaling(self, component, radius):
         """
-        Pick the RFO scaling ``a`` for one step component, starting from
-        the nominal ``self.a_max`` and reducing it only if that
-        component would leave its own trust ``radius``.
-
-        Near convergence the nominal step is already well inside the
-        radius -- it approaches the Newton step, which shrinks with the
-        gradient -- so no search happens and ``a_max`` is returned as is.
-        When the radius does bind, the step length shrinks monotonically
-        as ``a`` is reduced, so ``a`` is halved until the step is inside
-        the radius and the resulting bracket is closed with Brent's
-        method.  Searching in log(a) keeps the bracket well conditioned
-        when many halvings are needed.  Only linear algebra is involved,
-        no force evaluations.
+        RFO scaling: ``a_max`` unless ``component`` would leave ``radius``.
+        Then a is halved until it fits and the bracket is closed by Brent's
+        method in log(a); the step shrinks monotonically with a.
         """
         def excess(log_a):
             return (self._get_maxstep(component(np.exp(log_a)))
@@ -467,79 +347,32 @@ class SaddleClimb:
         log_a = brentq(excess, log_lo, log_hi, xtol=1e-3)
         return np.exp(log_a)
 
-    def _get_pfro_step(self, B_opt, g, a=None):
+    def _get_pfro_step(self, B_opt, g):
         """
-        Partitioned RFO step: maximized along the climb, minimized in
-        the space across it.  The climb is along the fixed climb mode
-        ``_climb_mode`` (on a directed step the chord to ``f*``, see
-        ``_get_climb_direction``), an exact eigenvector of ``B_opt``,
-        so shrinking the scaling shortens the step along the same line.
-        One scaling is solved for the whole step against the single
-        trust radius ``maxstep``, and both partitions use it.  With an
-        explicit ``a`` the search is skipped, and on a directed step
-        with ``path_climb`` the climb is instead the path structure at
-        the ``f*`` of that ``a`` (see ``_get_path_climb``).  The linear
-        truncation is kept as a safety net: the bracket is closed only
-        to ``xtol`` in log(a), and for the case where no bracket could
-        be found at all.
-
-        The descent runs across the climb step that is actually taken.
-        On the searched step that is the complement of the climb mode;
-        with an explicit ``a`` on the path the chord bends away from the
-        tangent, so the complement is rebuilt at every scaling tried --
-        one QR per trial, no force evaluations.
+        Partitioned RFO step: maximised along ``_climb_mode``, minimised
+        across it, with one scaling for both against ``maxstep``.  The
+        final truncation covers the inexact bracket and no bracket at all.
         """
         vmax = self._climb_mode
         basis, _ = LA.qr(vmax.reshape(-1, 1), mode='complete')
         vmin = basis[:, 1:]
 
-        if a is not None and self.path_climb and self._path is not None:
-            climb = (self._get_path_climb(B_opt, g)
-                     if self._climbing
-                     else lambda scale: np.zeros_like(g))
-        else:
-            def climb(scale):
-                return self._get_scaled_climb_step(B_opt, g, vmax, scale)
-
-        def descend_across(climb_step, scale):
-            """Descent across the climb step that is actually taken."""
-            norm = LA.norm(climb_step)
-            if norm == 0:
-                across = vmin
-            else:
-                frame, _ = LA.qr((climb_step / norm).reshape(-1, 1),
-                                 mode='complete')
-                across = frame[:, 1:]
-            return self._get_scaled_descend_step(B_opt, g, across, scale)
-
         def total(scale):
-            climb_step = climb(scale)
-            return climb_step + descend_across(climb_step, scale)
+            return (self._get_scaled_climb_step(B_opt, g, vmax, scale)
+                    + self._get_scaled_descend_step(B_opt, g, vmin, scale))
 
-        scale = (a if a is not None
-                 else self._get_pfro_scaling(total, self.maxstep))
-        step = total(scale)
+        step = total(self._get_pfro_scaling(total, self.maxstep))
         stepsize = self._get_maxstep(step)
         if stepsize > self.maxstep:
             step = step * (self.maxstep / stepsize)
         return step
 
-    def _get_step(self, B_opt, g):
-        """P-RFO step from the decoupled Hessian."""
-        return self._get_pfro_step(B_opt, g)
-
-    def _update_hessian(
-            self: None, B_old: np.ndarray,
-            dg: np.ndarray, dx: float
-            ) -> np.ndarray:
-        """
-        Hessian update procedure described by:
-
-        """
+    def _update_hessian(self, B_old, dg, dx):
+        """Bofill's TS-BFGS update of ``B_old`` for step dx and change dg."""
         eig, vec = LA.eigh(B_old)
         dxT = np.transpose(dx)
         dgT = np.transpose(dg)
-        B_abs = np.zeros(np.shape(self.hessian))
+        B_abs = np.zeros_like(B_old)
         for i in range(len(eig)):
             B_abs += np.abs(eig[i]) * np.outer(vec[:, i], vec[:, i].T)
         dx_square = np.outer(dx, dxT)
@@ -555,162 +388,114 @@ class SaddleClimb:
         B = B_old + E
         return B
 
-    def _initialize_atoms(self: None) -> tuple[Atoms, np.ndarray, np.ndarray]:
+    def _initialize_atoms(self) -> tuple[Atoms, list, np.ndarray]:
         atoms = self.atoms_initial.copy()
-        constraints = self.atoms_initial.constraints.copy()
-        atoms.set_constraint(constraints)
         atoms.calc = self.calculator
-        idx = self.indices.copy()
-        B_init = self.hessian.copy()
-        return atoms, idx, B_init
+        return atoms, self.indices.copy(), self.hessian.copy()
 
-    def _initialize_atoms_restart(self: None) -> tuple[Atoms,
-                                                       np.ndarray,
-                                                       np.ndarray]:
-        atoms = self._restart_trajectory.copy()
-        constraints = self._restart_trajectory.constraints.copy()
-        atoms.set_constraint(constraints)
+    def _initialize_atoms_restart(self) -> tuple[Atoms, list, np.ndarray]:
+        # The image pairs need the reactant's frame (see _get_image_pairs).
+        atoms = self._unwrap(self._restart_trajectory, self.atoms_initial)
         atoms.calc = self.calculator
-        idx = self.indices.copy()
         B_init = np.array(atoms.info["saddleclimb_hessian"])
+        return atoms, self.indices.copy(), B_init
 
-        return atoms, idx, B_init
-
-    def _initialize_run(self: None, atoms: Atoms, idx: list):
+    def _initialize_run(self, atoms: Atoms, idx: list):
         traj = Trajectory(self.trajfile, 'w')
-        g_init = -self._get_F(atoms)[idx, :].reshape(-1)
+        g_init = -atoms.get_forces()[idx, :].reshape(-1)
         E_init = atoms.calc.results['energy']
         traj.write(atoms)
-        Fmax = np.max(np.abs(g_init))
-        log_string = self._get_log_string(0, E_init, Fmax)
-        self._log(log_string)
+        self._log(self._get_log_string(0, E_init, self._get_maxstep(g_init)))
         return traj, g_init, E_init
 
-    def _get_final_energy(self):
-        """Energy of the final structure, one extra calculation."""
-        final = self.atoms_final.copy()
-        final.calc = self.calculator
-        return final.get_potential_energy()
+    def _get_energy(self, atoms):
+        """Energy of an end structure, one extra calculation."""
+        atoms = atoms.copy()
+        atoms.calc = self.calculator
+        return atoms.get_potential_energy()
 
-    def _initialize_run_restart(self: None, idx: list):
+    def _initialize_run_restart(self, idx: list):
         traj = Trajectory(self.trajfile, 'a')
-        g_tot = -self._restart_trajectory.calc.results['forces']
-        g = g_tot[idx, :].reshape(-1).copy()
-        E = self._restart_trajectory.calc.results['energy'] + 0
-        Fmax = LA.norm(-g.reshape(-1, 3), axis=1).max()
-        return traj, g, E, Fmax
+        results = self._restart_trajectory.calc.results
+        g = -results['forces'][idx, :].reshape(-1)
+        return traj, g, results['energy'], self._get_maxstep(g)
 
-    def _get_initial_step(
-            self: None, idx: list
-            ) -> tuple[np.ndarray, np.ndarray]:
+    def _get_initial_step(self) -> tuple[np.ndarray, np.ndarray]:
         """
-        First step: toward the middle of the path, ``maxstep`` long.
-
-        No energy is known yet for the fit of ``f*``, so the first step
-        takes ``f* = 0.5``: the chord from the initial structure to the
-        path structure at ``f = 0.5``, scaled so the furthest-moving atom
-        moves ``maxstep``.  If the chord is already shorter, it is taken
-        whole.  On a linear path this is the straight step toward the
-        final structure.
+        First step, before any energy is known: the chord to the path
+        structure at f = 0.5, cut to ``maxstep`` if it is longer.
         """
-        self._pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
-        self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
-        _, _, _, path_at = self._get_path_frame(self._pos_i_1D)
-        chord = self._hold_non_targets(
-            self._mic(path_at(0.5) - self._pos_i_1D))
+        _, _, path_at = self._get_path_frame(self._pos_i_1D)
+        chord = self._hold_non_targets(path_at(0.5) - self._pos_i_1D)
         dx_1D = chord * min(1.0, self.maxstep / self._get_maxstep(chord))
         return dx_1D.reshape(-1, 3), dx_1D
 
     def _get_log_string(self, n, E, Fmax):
-        n_str = str(n).ljust(20)
-        E_str = str(np.round(E, 6)).ljust(20)
-        F_str = str(np.round(Fmax, 6)).ljust(20)
-        log_string = n_str + E_str + F_str
-        return log_string
+        return (str(n).ljust(20) + str(np.round(E, 6)).ljust(20)
+                + str(np.round(Fmax, 6)).ljust(20))
 
-    def _log(self: None, string: str) -> None:
+    def _log(self, string: str) -> None:
         with open(self.logfile, 'a') as log:
             log.write(string + '\n')
-        sys.stdout.flush()
 
-    def _initialize_logging(self: None):
-        n_str = 'Iteration'.ljust(20)
-        E_str = 'Energy (eV)'.ljust(20)
-        F_str = 'Fmax (eV/A)'.ljust(20)
+    def _initialize_logging(self):
+        header = ('Iteration'.ljust(20) + 'Energy (eV)'.ljust(20)
+                  + 'Fmax (eV/A)'.ljust(20))
         if self._restart:
-            log_string = 'Restarting:\n' + n_str + E_str + F_str
+            header = 'Restarting:\n' + header
         else:
-            log_string = n_str + E_str + F_str
-        climb = Path(self.logfile)
-        if climb.exists() and not self._restart:
-            os.remove(self.logfile)
-        self._log(log_string)
+            Path(self.logfile).unlink(missing_ok=True)
+        self._log(header)
 
-    def _get_F(self, atoms):
-        try:
-            f = atoms.get_forces()
-        except Exception:
-            print('could not compute forces')
-            raise Exception('forces not able to be computed')
-        return f
-
-    def climb(self: None, maxsteps=None) -> None:
+    def climb(self, maxsteps=None) -> None:
         self._initialize_logging()
         if self._restart:
-            n = self._restart_trajectory.info['saddleclimb_iterations']
+            info = self._restart_trajectory.info
+            n = info['saddleclimb_iterations']
             atoms, idx, B = self._initialize_atoms_restart()
             traj, g, E, Fmax = self._initialize_run_restart(idx)
-            self._pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
-            self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
             pos_1D = atoms.positions[idx, :].reshape(-1)
-            dxi = self._get_maxstep(self._mic(self._pos_i_1D - pos_1D))
+            dxi = self._get_maxstep(self._pos_i_1D - pos_1D)
             self._step_count = n
-            info = self._restart_trajectory.info
             self._E_initial = info.get('saddleclimb_E_initial')
             self._E_final = info.get('saddleclimb_E_final')
             if self._E_initial is None or self._E_final is None:
-                first = self.atoms_initial.copy()
-                first.calc = self.calculator
-                self._E_initial = first.get_potential_energy()
-                self._E_final = self._get_final_energy()
+                self._E_initial = self._get_energy(self.atoms_initial)
+                self._E_final = self._get_energy(self.atoms_final)
             self._E_cur = E
-            prev = self._restart_trajectory.info.get('saddleclimb_prev_mode')
+            prev = info.get('saddleclimb_prev_mode')
             self._prev_mode = None if prev is None else np.array(prev)
-            self._streak = self._restart_trajectory.info.get(
-                'saddleclimb_streak', 0)
+            self._streak = info.get('saddleclimb_streak', 0)
             B_opt = self._get_B_opt(B, g, pos_1D)
-            dx_1D = self._get_step(B_opt, g)
+            dx_1D = self._get_pfro_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
         else:
             atoms, idx, B = self._initialize_atoms()
             traj, g, E = self._initialize_run(atoms, idx)
-            dx, dx_1D = self._get_initial_step(idx)
+            dx, dx_1D = self._get_initial_step()
             self._E_initial = E
-            self._E_final = self._get_final_energy()
+            self._E_final = self._get_energy(self.atoms_final)
             Fmax, dxi, n = 1, 0, 0
         while Fmax > self.fmax or dxi < self.min_travel:
             atoms.positions[idx, :] += dx
             pos_1D = atoms.positions[idx, :].reshape(-1)
-            dxi = self._get_maxstep(self._mic(self._pos_i_1D - pos_1D))
+            dxi = self._get_maxstep(self._pos_i_1D - pos_1D)
             g0 = g
-            f = self._get_F(atoms)
+            f = atoms.get_forces()
             g = -f[idx, :].reshape(-1)
             E = atoms.calc.results['energy']
-            dg = g - g0
-            Fmax = LA.norm(-g.reshape(-1, 3), axis=1).max()
-            B = self._update_hessian(B, dg, dx_1D)
+            Fmax = self._get_maxstep(g)
+            B = self._update_hessian(B, g - g0, dx_1D)
             self._step_count = n
             self._E_cur = E
             prev_mode, streak = self._prev_mode, self._streak
             B_opt = self._get_B_opt(B, g, pos_1D)
-            dx_1D = self._get_step(B_opt, g)
+            dx_1D = self._get_pfro_step(B_opt, g)
             dx = dx_1D.reshape(-1, 3)
             n += 1
-            log_string = self._get_log_string(n, E, Fmax)
-            self._log(log_string)
-            atoms.info["saddleclimb_hessian"] = B.tolist()
-            atoms.info["saddleclimb_hessian_shape"] = B.shape
-            atoms.info['saddleclimb_iterations'] = n + 0
+            self._log(self._get_log_string(n, E, Fmax))
+            atoms.info['saddleclimb_hessian'] = B.tolist()
+            atoms.info['saddleclimb_iterations'] = n
             atoms.info['saddleclimb_E_initial'] = float(self._E_initial)
             atoms.info['saddleclimb_E_final'] = float(self._E_final)
             atoms.info['saddleclimb_streak'] = int(streak)
@@ -730,119 +515,64 @@ class SaddleClimb:
         self._restart_trajectory = restart_trajectory
         self.climb()
 
-    def _get_bias_direction(self, pos_1D: np.ndarray) -> np.ndarray:
-        """Direction the climb is biased along, over the moving atoms."""
-        if self.interp == 'linear':
-            return self._mic(self._pos_f_1D - self._pos_i_1D)
-        pos = self.atoms_initial.positions.copy()
-        pos[self.indices, :] = pos_1D.reshape(-1, 3)
-        p_m = self._get_path_coordinate(pos)
-        f_minus = max(p_m - self.delta_f, 0)
-        f_plus = min(p_m + self.delta_f, 1)
-        return self._mic(self._get_qst_positions(pos, f_plus)
-                         - self._get_qst_positions(pos, f_minus))
+    def _get_path_coordinate(self, positions: np.ndarray) -> float:
+        """
+        Path coordinate p = d_R / (d_R + d_P), eqs. (4)-(5), over the bias
+        atoms only, so relaxing non-targets does not move p.
+        """
+        atoms = self._bias_atoms
+        d_R = LA.norm(positions[atoms] - self.atoms_initial.positions[atoms])
+        d_P = LA.norm(positions[atoms] - self.atoms_final.positions[atoms])
+        return d_R / (d_R + d_P)
 
     def _get_qst_positions(self, pos, f, guess=None):
         """
-        Moving-atom positions at ``f`` on the QST path through pos.
-
-        Only the bias atoms are fitted to the interpolated distances.
-        Every other atom is held where it is in ``pos``, so it still
-        shapes the fit through its pairs with the bias atoms but does
-        not move.  ``guess`` is the structure the fit starts from, and
-        it must agree with ``pos`` on every atom that is held; by
-        default it is ``pos``.
+        Moving-atom positions at f on the QST path through ``pos``
+        (Halgren and Lipscomb, Chem. Phys. Lett. 49 (1977) 225, eqs. 4-7),
+        each image pair weighted by w(r_f) + w(r_R) + w(r_P).  The fit
+        starts from ``guess`` (default ``pos``); only bias atoms move.
         """
-        pos_f = self.get_positions_from_distances(
-            self.get_qst_distances(pos, f), pos if guess is None else guess,
-            self._bias_atoms)
+        pairs = self._get_image_pairs(pos)
+        r_R, r_P, r_M = (self._image_distances(x, pairs) for x in (
+            self.atoms_initial.positions, self.atoms_final.positions, pos))
+        p_m = self._get_path_coordinate(pos)
+        denom = p_m * (1 - p_m)
+        gamma = 0 if denom == 0 else (r_M - (1 - p_m) * r_R - p_m * r_P) / denom
+        r_f = (1 - f) * r_R + f * r_P + gamma * f * (1 - f)
+        w = (self._cut_weight(r_f) + self._cut_weight(r_R)
+             + self._cut_weight(r_P))
+        pos_f = self._fit_positions(pairs, r_f, w,
+                                    pos if guess is None else guess)
         return pos_f[self.indices, :].reshape(-1)
 
-    def _get_path_coordinate(self, positions: np.ndarray) -> float:
+    def _fit_positions(self, pairs, r, w, guess):
         """
-        Path coordinate p of a structure, eqs. (4) and (5).
-
-        Measured over the bias atoms only, so relaxation of atoms
-        outside ``target_indices`` does not move p along the path, and
-        with minimum-image displacements to each end.
+        Minimise S = sum w (|x_b - x_a + T| - r)^2 over the bias atoms,
+        weakly tethered to ``guess``; every other atom is held there.
+        Returns an array shaped like ``guess``.
         """
-        atoms = self._bias_atoms
-        d_R = LA.norm(self._mic(
-            positions[atoms] - self.atoms_initial.positions[atoms]))
-        d_P = LA.norm(self._mic(
-            positions[atoms] - self.atoms_final.positions[atoms]))
-        return d_R / (d_R + d_P)
-
-    def get_qst_distances(self, positions: np.ndarray,
-                          f: float) -> np.ndarray:
-        """Interpolated distance matrix on the QST path through `positions`.
-
-        Follows eqs. (4)-(7) of Halgren and Lipscomb, Chem. Phys. Lett.
-        49 (1977) 225: the path coordinate p_m of the intermediate
-        structure sets the quadratic term, and `f` is the interpolation
-        parameter at which the distances are evaluated.
-        """
-        p_m = self._get_path_coordinate(positions)
-        r_R, r_P = self._r_R, self._r_P
-        r_M = self._pair_distances(positions)
-        denom = p_m * (1 - p_m)
-        if denom == 0:
-            gamma = np.zeros_like(r_M)
-        else:
-            gamma = (r_M - (1 - p_m) * r_R - p_m * r_P) / denom
-        return (1 - f) * r_R + f * r_P + gamma * f * (1 - f)
-
-    def get_positions_from_distances(self, r_interp: np.ndarray,
-                                     positions_guess: np.ndarray,
-                                     indices: list = None) -> np.ndarray:
-        """Cartesian positions that best reproduce `r_interp`.
-
-        Minimizes S of eq. (3) of Halgren and Lipscomb, Chem. Phys.
-        Lett. 49 (1977) 225, starting from (and weakly tethered to)
-        `positions_guess`.  Every pair distance enters S, but only
-        atoms in `indices` are free to move; the rest are held at their
-        guessed positions, where they still constrain the free atoms
-        through their shared pairs.  `indices=None` frees every atom.
-        Returns an array shaped like `atoms.positions`.
-
-        Pairs are weighted by 1/r_interp^4 + 1/r_R^4 + 1/r_P^4: the
-        interpolated distance as in eq. (3), plus the reactant and
-        product distances.  The first term weights a pair by how close
-        the path wants it at this point, which the endpoints alone
-        cannot know, so an intermediate image is not fitted with
-        fragments pushed into the surface or each other.  The other two
-        keep pairs that are bonded in the reactant, or in the product,
-        weighted while they are still far apart on the path.
-        """
-        free = (np.arange(len(positions_guess)) if indices is None
-                else np.asarray(indices))
-        iu = np.triu_indices(len(positions_guess), k=1)
-        r_i = r_interp[iu]
-        r_R, r_P = self._r_R[iu], self._r_P[iu]
-        w = 1 / r_i**4 + 1 / r_R**4 + 1 / r_P**4
-        x0 = positions_guess[free].reshape(-1)
-        # Images fixed from the guess, so S stays smooth during the fit.
-        offset = self._get_mic_offset(positions_guess)
+        free = np.asarray(self._bias_atoms)
+        # Pairs between held atoms, or with no weight, add a constant.
+        a, b, T = pairs
+        keep = (np.isin(a, free) | np.isin(b, free)) & (w > 0)
+        a, b, T, r, w = a[keep], b[keep], T[keep], r[keep], w[keep]
+        x0 = guess[free].reshape(-1)
 
         def S_and_grad(x):
-            pos = positions_guess.copy()
+            pos = guess.copy()
             pos[free] = x.reshape(-1, 3)
-            dpos = self._pair_vectors(pos, offset)
-            r_c = np.sqrt((dpos**2).sum(-1))
-            dr = r_c[iu] - r_i
+            dpos = pos[b] - pos[a] + T
+            r_c = LA.norm(dpos, axis=1)
+            dr = r_c - r
             dx = x - x0
             S = np.sum(w * dr**2) + 1e-6 * np.sum(dx**2)
-            c = np.zeros_like(r_c)
-            c[iu] = 2 * w * dr / r_c[iu]
-            c += c.T
-            grad = (c[:, :, None] * dpos).sum(axis=1)[free].reshape(-1)
-            return S, grad + 2e-6 * dx
+            c = (2 * w * dr / r_c)[:, None] * dpos
+            grad = np.zeros_like(pos)
+            np.add.at(grad, b, c)
+            np.add.at(grad, a, -c)
+            return S, grad[free].reshape(-1) + 2e-6 * dx
 
         res = minimize(S_and_grad, x0, jac=True, method='L-BFGS-B')
-        out = positions_guess.copy()
+        out = guess.copy()
         out[free] = res.x.reshape(-1, 3)
         return out
-
-    def normalize(self: None, v: np.ndarray) -> np.ndarray:
-        norm = LA.norm(v)
-        return v / norm
