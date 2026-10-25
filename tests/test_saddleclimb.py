@@ -215,9 +215,9 @@ def test_pfro_step_nulls_ascent_when_not_climbing():
                 <= climber.maxstep + 1e-9)
 
 
-def test_climb_guard_reads_the_gradient():
-    """The guard stops only when the raw gradient points away from both
-    ends."""
+def test_climb_guard_reads_the_uphill_climb_mode():
+    """The guard stops only when the uphill climb direction points away
+    from both ends; the sign of the mode itself does not matter."""
     climber = generate_saddleclimb_object()
     idx = climber.indices
     climber._pos_i_1D = climber.atoms_initial.positions[idx, :].reshape(-1)
@@ -229,8 +229,9 @@ def test_climb_guard_reads_the_gradient():
     dxf = climber._pos_f_1D - pos_1D
 
     # Uphill toward either end: still climbing.
-    assert climber._is_climbing(dhat, dxi, dxf)
-    assert climber._is_climbing(-dhat, dxi, dxf)
+    assert climber._is_climbing(dhat, dhat, dxi, dxf)
+    assert climber._is_climbing(-dhat, dhat, dxi, dxf)
+    assert climber._is_climbing(dhat, -dhat, dxi, dxf)
 
     # Uphill across the chord, away from both ends: stop.
     basis, _ = LA.qr(dhat.reshape(-1, 1), mode='complete')
@@ -238,8 +239,8 @@ def test_climb_guard_reads_the_gradient():
     far = climber._pos_i_1D + 0.5 * chord + 0.5 * off
     dxi = climber._pos_i_1D - far
     dxf = climber._pos_f_1D - far
-    assert not climber._is_climbing(off, dxi, dxf)
-    assert climber._is_climbing(-off, dxi, dxf)
+    assert not climber._is_climbing(off, off, dxi, dxf)
+    assert not climber._is_climbing(-off, off, dxi, dxf)
 
 
 def test_tripped_guard_nulls_the_climb_step_free_or_directed():
@@ -260,7 +261,7 @@ def test_tripped_guard_nulls_the_climb_step_free_or_directed():
     w = basis[:, 1]
     far = climber._pos_i_1D + 1.3 * chord + 0.5 * w
     g = 0.5 * dhat + 0.3 * w
-    assert not climber._is_climbing(g, climber._pos_i_1D - far,
+    assert not climber._is_climbing(dhat, g, climber._pos_i_1D - far,
                                     climber._pos_f_1D - far)
 
     for directed in (True, False):
@@ -626,3 +627,49 @@ def test_pair_distances_are_minimum_image_per_structure():
     moved.positions = pos
     assert_allclose(climber._pair_distances(pos),
                     moved.get_all_distances(mic=True), atol=1e-10)
+
+
+def test_displacements_to_the_ends_are_minimum_image():
+    """Shifting a moving atom of the current structure by a lattice vector
+    changes neither the path coordinate nor the guard."""
+    climber = generate_saddleclimb_object()
+    idx = climber.indices
+    climber._pos_i_1D = climber.atoms_initial.positions[idx, :].reshape(-1)
+    climber._pos_f_1D = climber.atoms_final.positions[idx, :].reshape(-1)
+    chord = climber._pos_f_1D - climber._pos_i_1D
+    pos = climber.atoms_initial.positions.copy()
+    pos[idx] = (climber._pos_i_1D + 0.3 * chord).reshape(-1, 3)
+    shifted = pos.copy()
+    h = idx[-1]
+    shifted[h] += climber.atoms_initial.cell[0] + climber.atoms_initial.cell[1]
+    assert_allclose(climber._get_path_coordinate(shifted),
+                    climber._get_path_coordinate(pos), atol=1e-10)
+
+    rng = np.random.default_rng(3)
+    n = 3 * len(idx)
+    A = rng.standard_normal((n, n))
+    B = A @ A.T + 2 * np.eye(n)
+    for g in (climber.normalize(chord),
+              rng.standard_normal(n)):
+        decisions = []
+        for p in (pos, shifted):
+            climber._get_B_opt(B, g, p[idx].reshape(-1))
+            decisions.append(climber._climbing)
+        assert decisions[0] == decisions[1]
+
+
+@pytest.mark.parametrize('interp', ['linear', 'qst'])
+def test_first_step_heads_for_the_middle_of_the_path(interp):
+    """The first step is the chord to the path structure at f = 0.5,
+    scaled so the furthest-moving atom moves ``maxstep``."""
+    climber = generate_saddleclimb_object(interp)
+    idx = climber.indices
+    _, dx_1D = climber._get_initial_step(idx)
+    _, _, _, path_at = climber._get_path_frame(climber._pos_i_1D)
+    chord = climber._hold_non_targets(
+        climber._mic(path_at(0.5) - climber._pos_i_1D))
+    assert_allclose(dx_1D @ chord, LA.norm(dx_1D) * LA.norm(chord),
+                    rtol=1e-10)
+    assert_allclose(climber._get_maxstep(dx_1D),
+                    min(climber.maxstep, climber._get_maxstep(chord)),
+                    rtol=1e-10)

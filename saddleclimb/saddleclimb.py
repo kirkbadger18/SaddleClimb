@@ -26,8 +26,8 @@ class SaddleClimb:
             trajfile: str = 'climb.traj',
             interp: str = 'qst',
 
-            hessian_scale: float = 20,
-            min_directed_steps: int = 8,
+            hessian_scale: float = 30,
+            min_directed_steps: int = 6,
             persistence: int = 3,
             maxstep: float = 0.15,
 
@@ -103,6 +103,15 @@ class SaddleClimb:
         out.positions = reference.positions + d
         return out
 
+    def _mic(self, d):
+        """
+        Minimum-image form of displacements ``d`` between two structures,
+        flat or shaped (n, 3), returned in the same shape.
+        """
+        mic, _ = find_mic(np.reshape(d, (-1, 3)), self.atoms_initial.cell,
+                          self.atoms_initial.pbc)
+        return mic.reshape(np.shape(d))
+
     def _get_mic_offset(self, positions):
         """Lattice shift making every pair of ``positions`` minimum-image."""
         raw = positions[:, None, :] - positions[None, :, :]
@@ -165,8 +174,9 @@ class SaddleClimb:
         give the tangent are kept, so they cost nothing again.
         """
         if self.interp == 'linear':
-            chord = self._hold_non_targets(self._pos_f_1D - self._pos_i_1D)
-            f = (pos_1D - self._pos_i_1D) @ chord / (chord @ chord)
+            chord = self._hold_non_targets(
+                self._mic(self._pos_f_1D - self._pos_i_1D))
+            f = self._mic(pos_1D - self._pos_i_1D) @ chord / (chord @ chord)
             return (f, chord, {f: pos_1D, f + 1: pos_1D + chord},
                     lambda f_star: pos_1D + (f_star - f) * chord)
         pos = self.atoms_initial.positions.copy()
@@ -176,7 +186,7 @@ class SaddleClimb:
         f_plus = min(p_m + self.delta_f, 1)
         x_minus = self._get_qst_positions(pos, f_minus)
         x_plus = self._get_qst_positions(pos, f_plus)
-        t = (self._hold_non_targets(x_plus - x_minus)
+        t = (self._hold_non_targets(self._mic(x_plus - x_minus))
              / (f_plus - f_minus))
         bias_rows = [self.indices.index(i) for i in self._bias_atoms]
 
@@ -207,16 +217,18 @@ class SaddleClimb:
         B_new = mult(new_basis, mult(B_transformed, new_basis.T))
         return B_new, new_basis[:, 0]
 
-    def _is_climbing(self, g, dxi, dxf):
+    def _is_climbing(self, v, g, dxi, dxf):
         """
-        False when the raw gradient ``g`` points away from both ends.
+        False when the uphill climb direction points away from both ends.
 
-        ``g`` points uphill, so a gradient with negative dot products
-        against the directions to the initial (``dxi``) and the final
-        (``dxf``) structure says that going uphill leads away from
-        both, off the path between them.
+        The climb mode ``v`` has no sign of its own, so it is oriented
+        uphill (positive dot product with the gradient ``g``) first,
+        then dotted with the directions to the initial (``dxi``) and
+        the final (``dxf``) structure.
         """
-        return not (np.dot(g, dxi) < 0 and np.dot(g, dxf) < 0)
+        if np.dot(v, g) < 0:
+            v = -v
+        return not (np.dot(v, dxi) < 0 and np.dot(v, dxf) < 0)
 
     def _update_streak(self, eigs, vecs):
         """
@@ -257,15 +269,16 @@ class SaddleClimb:
         chord to the energy maximum ``f*`` on the path (see
         ``_get_climb_direction``), and it is decoupled from the rest of
         B, so it is an exact eigenvector of the returned Hessian.
-        A step, free or directed, whose raw gradient points away from
-        both ends trips the guard (see ``_is_climbing``): ``_climbing``
+        A step, free or directed, whose climb mode (the lowest mode, or
+        the chord to ``f*``), oriented uphill, points away from both
+        ends trips the guard (see ``_is_climbing``): ``_climbing``
         is cleared and the climb component of that step is nulled,
         leaving the descent across the climb mode.  The guard affects
         only the step it trips on.  The climb mode is stored in
         ``_climb_mode``.
         """
-        dxi = self._pos_i_1D - pos_1D
-        dxf = self._pos_f_1D - pos_1D
+        dxi = self._mic(self._pos_i_1D - pos_1D)
+        dxf = self._mic(self._pos_f_1D - pos_1D)
         eigs_B, vecs_B = LA.eigh(B)
         self._update_streak(eigs_B, vecs_B)
         free = (self._step_count >= self.min_directed_steps
@@ -278,7 +291,7 @@ class SaddleClimb:
             self._path = self._get_path_frame(pos_1D)
             B_opt, v = self._get_directed_hessian(
                 B, self._get_climb_direction(B, g, pos_1D))
-        self._climbing = self._is_climbing(g, dxi, dxf)
+        self._climbing = self._is_climbing(v, g, dxi, dxf)
         self._climb_mode = v
         self._free = free
         return B_opt
@@ -395,7 +408,7 @@ class SaddleClimb:
         if f_max is None:
             f_max = np.clip(f + self._get_scaled_path_step(
                 t @ B @ t, t @ g, self.a_max), 0, 1)
-        dx = self._hold_non_targets(path_at(f_max) - pos_1D)
+        dx = self._hold_non_targets(self._mic(path_at(f_max) - pos_1D))
         norm = LA.norm(dx)
         return tangent if norm == 0 else dx / norm
 
@@ -413,8 +426,8 @@ class SaddleClimb:
         f, t, _, path_at = self._path
         G_f, H_f = t @ g, t @ B_opt @ t
         x0 = self._pos_cur
-        return lambda scale: path_at(np.clip(
-            f + self._get_scaled_path_step(H_f, G_f, scale), 0, 1)) - x0
+        return lambda scale: self._mic(path_at(np.clip(
+            f + self._get_scaled_path_step(H_f, G_f, scale), 0, 1)) - x0)
 
     def _get_pfro_scaling(self, component, radius):
         """
@@ -591,27 +604,21 @@ class SaddleClimb:
             self: None, idx: list
             ) -> tuple[np.ndarray, np.ndarray]:
         """
-        First step: along the interpolation path, ``maxstep`` long.
+        First step: toward the middle of the path, ``maxstep`` long.
 
-        The step is the chord from the initial structure to the path
-        structure at ``f``, with ``f`` found by fixed-point iteration
-        from the tangent so the furthest-moving atom moves ``maxstep``,
-        then scaled onto ``maxstep`` exactly.  On a linear path this is
-        the straight step toward the final structure.
+        No energy is known yet for the fit of ``f*``, so the first step
+        takes ``f* = 0.5``: the chord from the initial structure to the
+        path structure at ``f = 0.5``, scaled so the furthest-moving atom
+        moves ``maxstep``.  If the chord is already shorter, it is taken
+        whole.  On a linear path this is the straight step toward the
+        final structure.
         """
         self._pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
         self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
         _, _, _, path_at = self._get_path_frame(self._pos_i_1D)
-
-        def excess(f):
-            return self._get_maxstep(self._hold_non_targets(
-                path_at(f) - self._pos_i_1D)) - self.maxstep
-
-        # The step is the path structure itself, not a chord to it, so
-        # it lies on the path.  If even the product is closer than
-        # maxstep, the step is the whole path.
-        f = 1.0 if excess(1.0) <= 0 else brentq(excess, 0.0, 1.0, xtol=1e-8)
-        dx_1D = self._hold_non_targets(path_at(f) - self._pos_i_1D)
+        chord = self._hold_non_targets(
+            self._mic(path_at(0.5) - self._pos_i_1D))
+        dx_1D = chord * min(1.0, self.maxstep / self._get_maxstep(chord))
         return dx_1D.reshape(-1, 3), dx_1D
 
     def _get_log_string(self, n, E, Fmax):
@@ -656,7 +663,7 @@ class SaddleClimb:
             self._pos_f_1D = self.atoms_final.positions[idx, :].reshape(-1)
             self._pos_i_1D = self.atoms_initial.positions[idx, :].reshape(-1)
             pos_1D = atoms.positions[idx, :].reshape(-1)
-            dxi = self._get_maxstep(self._pos_i_1D - pos_1D)
+            dxi = self._get_maxstep(self._mic(self._pos_i_1D - pos_1D))
             self._step_count = n
             info = self._restart_trajectory.info
             self._E_initial = info.get('saddleclimb_E_initial')
@@ -684,7 +691,7 @@ class SaddleClimb:
         while Fmax > self.fmax or dxi < self.min_travel:
             atoms.positions[idx, :] += dx
             pos_1D = atoms.positions[idx, :].reshape(-1)
-            dxi = self._get_maxstep(self._pos_i_1D - pos_1D)
+            dxi = self._get_maxstep(self._mic(self._pos_i_1D - pos_1D))
             g0 = g
             f = self._get_F(atoms)
             g = -f[idx, :].reshape(-1)
@@ -726,14 +733,14 @@ class SaddleClimb:
     def _get_bias_direction(self, pos_1D: np.ndarray) -> np.ndarray:
         """Direction the climb is biased along, over the moving atoms."""
         if self.interp == 'linear':
-            return self._pos_f_1D - self._pos_i_1D
+            return self._mic(self._pos_f_1D - self._pos_i_1D)
         pos = self.atoms_initial.positions.copy()
         pos[self.indices, :] = pos_1D.reshape(-1, 3)
         p_m = self._get_path_coordinate(pos)
         f_minus = max(p_m - self.delta_f, 0)
         f_plus = min(p_m + self.delta_f, 1)
-        return (self._get_qst_positions(pos, f_plus)
-                - self._get_qst_positions(pos, f_minus))
+        return self._mic(self._get_qst_positions(pos, f_plus)
+                         - self._get_qst_positions(pos, f_minus))
 
     def _get_qst_positions(self, pos, f, guess=None):
         """
@@ -756,11 +763,14 @@ class SaddleClimb:
         Path coordinate p of a structure, eqs. (4) and (5).
 
         Measured over the bias atoms only, so relaxation of atoms
-        outside ``target_indices`` does not move p along the path.
+        outside ``target_indices`` does not move p along the path, and
+        with minimum-image displacements to each end.
         """
         atoms = self._bias_atoms
-        d_R = LA.norm(positions[atoms] - self.atoms_initial.positions[atoms])
-        d_P = LA.norm(positions[atoms] - self.atoms_final.positions[atoms])
+        d_R = LA.norm(self._mic(
+            positions[atoms] - self.atoms_initial.positions[atoms]))
+        d_P = LA.norm(self._mic(
+            positions[atoms] - self.atoms_final.positions[atoms]))
         return d_R / (d_R + d_P)
 
     def get_qst_distances(self, positions: np.ndarray,
