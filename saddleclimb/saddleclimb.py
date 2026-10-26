@@ -7,7 +7,6 @@ from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io.trajectory import Trajectory
 from numpy.polynomial import Polynomial
 from scipy.optimize import brentq, minimize
-from ase.geometry import find_mic
 from ase.neighborlist import primitive_neighbor_list
 from pathlib import Path
 
@@ -25,21 +24,23 @@ class SaddleClimb:
             trajfile: str = 'climb.traj',
             interp: str = 'qst',
 
-            hessian_scale: float = 25,
-            min_directed_steps: int = 10,
+            hessian_scale: float = 50,
+            min_directed_steps: int = 8,
             persistence: int = 3,
-            maxstep: float = 0.1,
+            maxstep: float = 0.2,
 
             min_travel: float = 0.1,
             a_max: float = 1,
             max_scaling_halvings: int = 60,
             delta_f: float = 0.01,
-            r_cut: float = 6.0,
+            r_cut: float = 6,
             path_climb: bool = True,
             ) -> None:
 
         self.atoms_initial = atoms_initial
-        self.atoms_final = self._unwrap(atoms_final, atoms_initial)
+        # R and P are taken in the frame given: each atom's P position is
+        # where it ends up from R, so displacements are plain differences.
+        self.atoms_final = atoms_final
         self.target_indices = target_indices
         self.calculator = calculator
         assert interp in ('linear', 'qst')
@@ -87,20 +88,6 @@ class SaddleClimb:
         self._pos_i_1D = self.atoms_initial.positions[self.indices].reshape(-1)
         self._pos_f_1D = self.atoms_final.positions[self.indices].reshape(-1)
         self.hessian = hessian_scale * np.eye(3*len(self.indices))
-
-    @staticmethod
-    def _unwrap(atoms, reference):
-        """
-        Copy of ``atoms`` with each atom on its image nearest ``reference``.
-        This puts every structure in the reactant's continuous frame, where
-        displacements are plain differences: the QST image pairs need that,
-        and a minimum-image one can point to another image of an end.
-        """
-        out = atoms.copy()
-        d, _ = find_mic(atoms.positions - reference.positions,
-                        reference.cell, reference.pbc)
-        out.positions = reference.positions + d
-        return out
 
     def _get_image_pairs(self, positions):
         """
@@ -394,8 +381,7 @@ class SaddleClimb:
         return atoms, self.indices.copy(), self.hessian.copy()
 
     def _initialize_atoms_restart(self) -> tuple[Atoms, list, np.ndarray]:
-        # The image pairs need the reactant's frame (see _get_image_pairs).
-        atoms = self._unwrap(self._restart_trajectory, self.atoms_initial)
+        atoms = self._restart_trajectory.copy()
         atoms.calc = self.calculator
         B_init = np.array(atoms.info["saddleclimb_hessian"])
         return atoms, self.indices.copy(), B_init

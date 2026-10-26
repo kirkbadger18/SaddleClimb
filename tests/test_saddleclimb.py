@@ -518,32 +518,22 @@ def test_shrinking_alpha_keeps_the_climb_direction(interp):
     assert LA.norm(climbs[2]) < LA.norm(climbs[1]) < LA.norm(climbs[0])
 
 
-def test_endpoint_wrapped_across_the_cell_moves_the_short_way():
-    """An atom held on the far side of the cell in the final structure is
-    unwrapped onto its nearest image, so the chord, the first step and
-    the product distances all take the short, minimum-image way."""
+def test_final_structure_is_taken_in_the_frame_given():
+    """An atom placed one lattice vector further on in the final structure
+    is taken to travel that far: it is not moved to a nearer image."""
     init = fcc111('Pt', size=(3, 3, 4), vacuum=10.0)
     add_adsorbate(init, 'H', 1.5, 'fcc')
     final = init.copy()
     h = len(init) - 1
-    hop = np.array([0.3, 0.2, 0.0])
-    final.positions[h] += hop + init.cell[1]
-    climber = SaddleClimb(init, final, EMT())
+    travel = np.array([0.3, 0.2, 0.0]) + init.cell[1]
+    final.positions[h] += travel
+    climber = SaddleClimb(init, final, EMT(), interp='linear')
 
     assert climber.indices == [h]
-    assert_allclose(climber.atoms_final.positions[h],
-                    init.positions[h] + hop, atol=1e-10)
-    pairs = climber._get_image_pairs(climber.atoms_initial.positions)
-    a, b, _ = pairs
-    on_h = (a == h) | (b == h)
-    hop_d = climber._image_distances(climber.atoms_final.positions, pairs)
-    assert_allclose(np.sort(hop_d[on_h])[:3],
-                    np.sort(final.get_distances(h, range(h), mic=True))[:3],
-                    atol=1e-10)
-
+    assert_allclose(climber.atoms_final.positions, final.positions)
     dx, _ = climber._get_initial_step()
-    assert dx[0] @ hop > 0
-    assert LA.norm(dx[0]) <= LA.norm(hop) + 1e-10
+    assert_allclose(dx[0] @ travel, LA.norm(dx[0]) * LA.norm(travel),
+                    rtol=1e-6)
 
 
 def test_image_pairs_keep_one_image_from_reactant_to_product():
@@ -597,7 +587,7 @@ def test_molecule_keeps_every_pair_at_full_weight():
     assert climber._cut_weight(np.array([30.0]))[0] == 1 / 30.0**4
 
 
-def test_displacements_to_the_ends_stay_in_the_reactant_frame():
+def test_displacements_to_the_ends_are_plain_differences():
     """An atom more than half a cell from the product still measures
     towards the product the path runs to, not towards a nearer image of
     it, in both the path coordinate and the guard."""
@@ -614,18 +604,16 @@ def test_displacements_to_the_ends_stay_in_the_reactant_frame():
     assert not climber._climbing
 
 
-def test_restart_structure_is_unwrapped_into_the_reactant_frame():
-    """A restart structure with an atom on another image of the cell is
-    put back next to the reactant before the climb goes on."""
+def test_restart_structure_is_taken_as_written():
+    """A restart continues from the positions in the trajectory, which the
+    climb wrote in its own frame."""
     climber = generate_saddleclimb_object()
     restart = climber.atoms_initial.copy()
     restart.positions[-1] += [0.2, 0.1, 0] + restart.cell[0]
     restart.info['saddleclimb_hessian'] = climber.hessian.tolist()
     climber._restart_trajectory = restart
     atoms, _, _ = climber._initialize_atoms_restart()
-    expected = climber.atoms_initial.positions.copy()
-    expected[-1] += [0.2, 0.1, 0]
-    assert_allclose(atoms.positions, expected, atol=1e-10)
+    assert_allclose(atoms.positions, restart.positions)
 
 
 @pytest.mark.parametrize('interp', ['linear', 'qst'])
