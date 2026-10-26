@@ -512,7 +512,8 @@ class SaddleClimb:
             self.atoms_initial.positions, self.atoms_final.positions, pos))
         p_m = self._get_path_coordinate(pos)
         denom = p_m * (1 - p_m)
-        gamma = 0 if denom == 0 else (r_M - (1 - p_m) * r_R - p_m * r_P) / denom
+        gamma = (0 if denom == 0
+                 else (r_M - (1 - p_m) * r_R - p_m * r_P) / denom)
         r_f = (1 - f) * r_R + f * r_P + gamma * f * (1 - f)
         w = (self._cut_weight(r_f) + self._cut_weight(r_R)
              + self._cut_weight(r_P))
