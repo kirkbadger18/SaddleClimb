@@ -438,62 +438,45 @@ def directed_setup(interp, scale=0.2):
 
 @pytest.mark.parametrize('interp', ['linear', 'qst'])
 def test_path_climb_search_fills_the_trust_radius(interp):
-    """
-    With a large gradient the step fills the trust radius, and its climb
-    part, read as a move along f, lands on the path.
-    """
+    """With a large gradient the step fills the trust radius and climbs."""
     climber, B, g, pos = directed_setup(interp)
     g = 8 * g
     B_opt = climber._get_B_opt(B, g, pos)
-    f, t, path_at = climber._get_path_frame(pos)
     step = climber._get_pfro_step(B_opt, g)
     assert_allclose(climber._get_maxstep(step), climber.maxstep, rtol=2e-2)
-
-    # The climb part of the step, as a move along f, lands on the path.
-    descent = LA.lstsq(
-        LA.qr(climber._climb_mode.reshape(-1, 1), mode='complete')[0][:, 1:],
-        step, rcond=None)[0]
-    across = LA.qr(climber._climb_mode.reshape(-1, 1),
-                   mode='complete')[0][:, 1:] @ descent
-    climb = step - across
-    assert LA.norm(climb) > 0
-    f_new = f + (climb @ t) / (t @ t)
-    assert_allclose(path_at(np.clip(f_new, 0, 1)) - pos, climb, atol=2e-3)
+    assert abs(step @ climber._climb_mode) > 0
 
 
-def test_path_climb_cannot_pass_the_end_structures():
-    """A huge gradient along the path stops f* at the final structure,
-    so the climb heads straight for it."""
-    climber, B, g, pos = directed_setup('qst', scale=0.5)
-    _, t, _ = climber._get_path_frame(pos)
-    climber._get_B_opt(B, 1e4 * t / LA.norm(t), pos)
-    to_final = climber._pos_f_1D - pos
-    assert_allclose(abs(climber._climb_mode @ to_final) / LA.norm(to_final),
-                    1, atol=1e-4)
-
-
-def test_path_climb_off_climbs_the_tangent():
-    """With ``path_climb=False`` the climb mode is the path tangent."""
-    climber, B, g, pos = directed_setup('qst')
-    climber.path_climb = False
-    climber._get_B_opt(B, g, pos)
-    _, t, _ = climber._get_path_frame(pos)
-    assert_allclose(abs(climber._climb_mode @ t) / LA.norm(t), 1, atol=1e-12)
+def test_fit_without_interior_maximum_climbs_to_the_middle():
+    """
+    Energy and slope on the smoothstep E_P (10f^3 - 15f^4 + 6f^5), which
+    rises to P with no interior maximum, give no fitted f*; the climb
+    heads for the path structure at f* = 0.5.
+    """
+    climber, B, _, pos = directed_setup('qst')
+    f, t, path_at = climber._get_path_frame(pos)
+    E_P = 1.0
+    climber._E_initial, climber._E_final = 0.0, E_P
+    climber._E_cur = E_P * (10*f**3 - 15*f**4 + 6*f**5)
+    G_f = E_P * (30*f**2 - 60*f**3 + 30*f**4)
+    assert climber._get_path_energy_max(f, G_f) is None
+    climber._get_B_opt(B, G_f * t / (t @ t), pos)
+    chord = path_at(0.5) - pos
+    assert_allclose(abs(climber._climb_mode @ chord) / LA.norm(chord),
+                    1, atol=1e-10)
 
 
 @pytest.mark.parametrize('interp', ['linear', 'qst'])
 def test_directed_climb_mode_is_the_chord_to_f_star_and_an_eigenvector(interp):
     """
-    Without energies f* is the P-RFO maximum along f at ``a_max``; the
-    climb mode is the unit chord to the path there, and an exact
-    eigenvector of B_opt with its own curvature.
+    Without energies f* falls back to 0.5; the climb mode is the unit
+    chord to the path there, and an exact eigenvector of B_opt with its
+    own curvature.
     """
     climber, B, g, pos = directed_setup(interp)
     B_opt = climber._get_B_opt(B, g, pos)
-    f, t, path_at = climber._get_path_frame(pos)
-    f_star = np.clip(f + climber._get_scaled_path_step(
-        t @ B @ t, t @ g, climber.a_max), 0, 1)
-    chord = path_at(f_star) - pos
+    _, _, path_at = climber._get_path_frame(pos)
+    chord = path_at(0.5) - pos
     v = climber._climb_mode
     assert_allclose(abs(v @ chord) / LA.norm(chord), 1, atol=1e-10)
     assert_allclose(B_opt @ v, (v @ B @ v) * v, atol=1e-10)

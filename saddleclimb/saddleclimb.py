@@ -29,12 +29,11 @@ class SaddleClimb:
             persistence: int = 3,
             maxstep: float = 0.2,
 
+            r_cut: float = 6,
             min_travel: float = 0.1,
             a_max: float = 1,
             max_scaling_halvings: int = 60,
             delta_f: float = 0.01,
-            r_cut: float = 6,
-            path_climb: bool = True,
             ) -> None:
 
         self.atoms_initial = atoms_initial
@@ -48,7 +47,6 @@ class SaddleClimb:
         self.delta_f = delta_f
         # Molecules keep every pair at full weight, as in eq. (2).
         self.r_cut = r_cut if self.atoms_initial.pbc.any() else np.inf
-        self.path_climb = path_climb
         self.fmax = fmax
         self.maxstep = maxstep
         self.min_travel = min_travel
@@ -214,7 +212,7 @@ class SaddleClimb:
             B_opt, v = B, vecs_B[:, 0]
         else:
             B_opt, v = self._get_directed_hessian(
-                B, self._get_climb_direction(B, g, pos_1D))
+                B, self._get_climb_direction(g, pos_1D))
         self._climbing = self._is_climbing(v, g, dxi, dxf)
         self._climb_mode = v
         self._free = free
@@ -237,11 +235,6 @@ class SaddleClimb:
         ])
         _, svecs_max = LA.eigh(climb_M)
         return (a*svecs_max[0, 1] / svecs_max[1, 1]) * vmax
-
-    def _get_scaled_path_step(self, H_f, G_f, a):
-        """P-RFO maximum along f, from dE/df ``G_f`` and d2E/df2 ``H_f``."""
-        _, svecs = LA.eigh(np.array([[a**2*H_f, a*G_f], [a*G_f, 0.0]]))
-        return a*svecs[0, 1] / svecs[1, 1]
 
     def _get_scaled_descend_step(self, B_opt, g, vmin, a):
         """Descent component, minimised in the space spanned by ``vmin``."""
@@ -288,23 +281,19 @@ class SaddleClimb:
                 best = r
         return None if best is None else float(best)
 
-    def _get_climb_direction(self, B, g, pos_1D):
+    def _get_climb_direction(self, g, pos_1D):
         """
         Unit chord to the path structure at f*: the fitted energy maximum,
-        else the P-RFO maximum along f at ``a_max``, kept in [0, 1].  The
-        tangent with ``path_climb`` off or when f* is where we already are.
+        else the middle of the path, f* = 0.5.  The tangent only when f* is
+        where we already are.
         """
         f, t, path_at = self._get_path_frame(pos_1D)
-        tangent = t / LA.norm(t)
-        if not self.path_climb:
-            return tangent
         f_max = self._get_path_energy_max(f, t @ g)
         if f_max is None:
-            f_max = np.clip(f + self._get_scaled_path_step(
-                t @ B @ t, t @ g, self.a_max), 0, 1)
+            f_max = 0.5
         dx = self._hold_non_targets(path_at(f_max) - pos_1D)
         norm = LA.norm(dx)
-        return tangent if norm == 0 else dx / norm
+        return t / LA.norm(t) if norm == 0 else dx / norm
 
     def _get_pfro_scaling(self, component, radius):
         """
