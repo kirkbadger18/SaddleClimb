@@ -9,6 +9,8 @@ This folder holds a benchmark of SaddleClimb v0.5.0 on 45 surface reactions comp
 | `Total_results.csv` | Gradient calls for SaddleClimb (forward and reverse) and NEB on all 45 reactions, with NEB notes, reaction family, and whether each run completed (converged to the correct saddle). |
 | `NEB_comparison.csv` | The 23 reactions with a converged NEB that found the same saddle, with averages and the SaddleClimb speedup. |
 
+The full calculation data (ASE run scripts, Quantum ESPRESSO inputs and outputs, trajectories, and logs for every optimization, Sella, IRC, SaddleClimb, and NEB run) is too large for this repository and is archived on Zenodo: https://zenodo.org/records/23740279. It extracts to `Benchmarking/<metal>/<reaction>/`, one folder per reaction, where `X` in a folder name marks a surface site.
+
 ## Systems
 
 - **Pt(111)**: 40 reactions of C, N, O, and H adsorbates (C-H, N-H, O-H, C-C, C-N, C-O, N-N, and N-O bond breaking, plus abstraction reactions), on a four-layer 3x3 slab.
